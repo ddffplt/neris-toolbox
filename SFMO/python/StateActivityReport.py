@@ -185,9 +185,12 @@ def _month_label(dt_or_str):
 def fetch_incidents_for_entity(client, state_code, neris_id_entity, page_size=100):
     """
     Fetch all incidents for a single department.
-    Returns a dict: { 'Mon-YYYY': count }
+    Returns month counts and incident type counts for the department.
     """
     month_counts = defaultdict(int)
+    type_counts = defaultdict(int)
+    total_incidents = 0
+    multiple_type_incidents = 0
     next_cursor  = None
 
     while True:
@@ -205,17 +208,35 @@ def fetch_incidents_for_entity(client, state_code, neris_id_entity, page_size=10
             break
 
         for inc in batch:
+            total_incidents += 1
             disp = inc.get("dispatch") or {}
             ts   = disp.get("call_create") or disp.get("call_create_start")
             lbl  = _month_label(ts)
             if lbl:
                 month_counts[lbl] += 1
 
+            fire_parts = {
+                incident_type.get("type", "").split("||", 1)[0].strip()
+                for incident_type in (inc.get("incident_types") or [])
+                if isinstance(incident_type, dict)
+                and incident_type.get("type")
+                and incident_type.get("type").split("||", 1)[0].strip()
+            }
+            for fire_part in fire_parts:
+                type_counts[fire_part] += 1
+            if len(fire_parts) > 1:
+                multiple_type_incidents += 1
+
         next_cursor = res.get("next_cursor")
         if not next_cursor:
             break
 
-    return dict(month_counts)
+    return {
+        "months": dict(month_counts),
+        "types": dict(type_counts),
+        "total": total_incidents,
+        "multiple_types": multiple_type_incidents,
+    }
 
 
 def fetch_nars_for_entity(client, state_code, neris_id_entity, page_size=100):
@@ -267,7 +288,9 @@ def generate_month_columns():
 # 5. EXCEL EXPORT
 # ─────────────────────────────────────────────
 
-def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags):
+def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags,
+                    type_counts):
+    from report_metadata import add_report_sources_sheet
     import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -278,10 +301,21 @@ def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags):
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "Monthly Incident Counts"
+    ws.title = "Incident Type Summary"
+
+    type_names = sorted({
+        type_name
+        for department_data in type_counts.values()
+        for type_name in department_data["types"]
+    })
+    summary_headers = (
+        ["NERIS Entity ID", "Department Name"]
+        + type_names
+        + ["Total Incidents", "Multiple Incident Types"]
+    )
+    ws.append(summary_headers)
 
     header_cols = ["NERIS Entity ID", "Department Name"] + month_cols
-    ws.append(header_cols)
 
     hdr_fill     = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     nar_fill     = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -301,8 +335,22 @@ def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags):
         cell.font      = hdr_font
         cell.alignment = hdr_aln
 
-    total_row_idx = len(df_pivot) + 1   # 1-indexed, +1 for header
-    rows = df_pivot.values.tolist()
+    summary_rows = []
+    for eid in sorted(type_counts):
+        department_data = type_counts[eid]
+        summary_rows.append(
+            [eid, department_data["name"]]
+            + [department_data["types"].get(type_name, 0) for type_name in type_names]
+            + [department_data["total"], department_data["multiple_types"]]
+        )
+    summary_rows.append(
+        ["TOTAL", ""]
+        + [sum(row[2 + index] for row in summary_rows) for index in range(len(type_names))]
+        + [sum(row[-2] for row in summary_rows), sum(row[-1] for row in summary_rows)]
+    )
+
+    total_row_idx = len(summary_rows) + 1
+    rows = summary_rows
     for r_idx, row_data in enumerate(rows, start=2):
         is_total = (r_idx == total_row_idx)
         for c_idx, val in enumerate(row_data, start=1):
@@ -327,16 +375,53 @@ def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags):
 
     ws.column_dimensions["A"].width = 20
     ws.column_dimensions["B"].width = 35
-    for i in range(3, len(header_cols) + 1):
+    for i in range(3, len(summary_headers) + 1):
         ws.column_dimensions[get_column_letter(i)].width = 11
 
     ws.freeze_panes = "C2"
+
+    monthly_ws = wb.create_sheet("Monthly Incident Counts")
+    monthly_ws.append(header_cols)
+    for cell in monthly_ws[1]:
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = hdr_aln
+
+    monthly_rows = df_pivot.values.tolist()
+    for r_idx, row_data in enumerate(monthly_rows, start=2):
+        is_total = (r_idx == len(monthly_rows) + 1)
+        for c_idx, val in enumerate(row_data, start=1):
+            cell = monthly_ws.cell(row=r_idx, column=c_idx, value=val)
+            cell.border = thin_border
+            if is_total:
+                cell.fill = total_fill
+                cell.font = total_font
+                cell.alignment = ctr_aln
+            elif c_idx <= 2:
+                cell.alignment = left_aln
+            elif val == "NAR":
+                cell.fill = nar_fill
+                cell.font = Font(italic=True, color="7F6000")
+                cell.alignment = ctr_aln
+            elif val == "":
+                cell.fill = no_data_fill
+                cell.alignment = ctr_aln
+            else:
+                cell.alignment = ctr_aln
+
+    monthly_ws.column_dimensions["A"].width = 20
+    monthly_ws.column_dimensions["B"].width = 35
+    for i in range(3, len(header_cols) + 1):
+        monthly_ws.column_dimensions[get_column_letter(i)].width = 11
+    monthly_ws.freeze_panes = "C2"
 
     # Legend sheet
     ws_legend  = wb.create_sheet("Legend")
     legend_data = [
         ("Symbol",       "Meaning"),
-        ("(number)",     "Count of incidents reported for that department in that month"),
+        ("(number)",     "Count of incidents for that department and fire-part incident type"),
+        ("Total Incidents", "Total incidents reported for that department"),
+        ("Multiple Incident Types", "Incidents with more than one fire-part incident type"),
         ("NAR",          "No-Activity Report filed — department confirmed zero incidents"),
         ("(grey blank)", "No incidents and no no-activity report submitted for that month"),
         ("TOTAL row",    "Sum of numeric incident counts across all departments per month"),
@@ -348,6 +433,14 @@ def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags):
         cell.font = hdr_font
     ws_legend.column_dimensions["A"].width = 14
     ws_legend.column_dimensions["B"].width = 75
+
+    add_report_sources_sheet(
+        wb,
+        "StateActivityReport.py",
+        f"{month_cols[0]} through {month_cols[-1]}",
+        [("Monthly columns", f"{month_cols[0]} through {month_cols[-1]}"),
+         ("Included sheets", "Incident Type Summary, Monthly Incident Counts, Legend")],
+    )
 
     wb.save(filename)
     return filename
@@ -374,6 +467,7 @@ def main():
     print("(progress updates every 50 departments)\n")
 
     inc_counts = {}   # { eid: { 'Mon-YYYY': count } }
+    type_counts = {}  # { eid: { name, types, total, multiple_types } }
     nar_flags  = {}   # { eid: { 'Mon-YYYY', ... } }
     completed  = 0
     errors     = []
@@ -381,13 +475,13 @@ def main():
     _first_dept_done = {"done": False}
 
     def fetch_dept_data(eid):
-        counts = fetch_incidents_for_entity(client, state_code, eid)
+        incident_data = fetch_incidents_for_entity(client, state_code, eid)
         nars   = fetch_nars_for_entity(client, state_code, eid)
         if not _first_dept_done["done"]:
             _first_dept_done["done"] = True
             print(f"\n  [Diagnostic] First dept {eid}: "
-                  f"{sum(counts.values())} incidents, {len(nars)} NAR months")
-        return eid, counts, nars
+                  f"{incident_data['total']} incidents, {len(nars)} NAR months")
+        return eid, incident_data, nars
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_dept_data, eid): eid for eid in all_eids}
@@ -396,12 +490,24 @@ def main():
         for future in as_completed(futures):
             eid = futures[future]
             try:
-                eid, counts, nars = future.result()
-                inc_counts[eid]   = counts
-                nar_flags[eid]    = nars
+                eid, incident_data, nars = future.result()
+                inc_counts[eid] = incident_data["months"]
+                type_counts[eid] = {
+                    "name": all_entities.get(eid, ""),
+                    "types": incident_data["types"],
+                    "total": incident_data["total"],
+                    "multiple_types": incident_data["multiple_types"],
+                }
+                nar_flags[eid] = nars
             except Exception as e:
                 errors.append((eid, str(e)))
                 inc_counts[eid] = {}
+                type_counts[eid] = {
+                    "name": all_entities.get(eid, ""),
+                    "types": {},
+                    "total": 0,
+                    "multiple_types": 0,
+                }
                 nar_flags[eid]  = set()
                 if first_errors_shown < 3:
                     print(f"\n  ⚠ ERROR for {eid}: {e}")
@@ -460,7 +566,9 @@ def main():
 
     print(f"\nPivot table: {len(df_pivot)-1} departments x {len(month_cols)} months")
 
-    filename = export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags)
+    filename = export_to_excel(
+        df_pivot, month_cols, state_code, inc_counts, nar_flags, type_counts
+    )
 
     print(f"\n✓ Exported: {filename}")
     print(f"  Departments : {len(df_pivot)-1}")

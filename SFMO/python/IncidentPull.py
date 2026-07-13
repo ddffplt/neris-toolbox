@@ -195,6 +195,7 @@ def get_state_incidents(client, state_code,
 
 
 def export_to_excel(incidents, client, state_code):
+    from report_metadata import add_report_sources_sheet, incident_date_range
     import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -623,9 +624,45 @@ def export_to_excel(incidents, client, state_code):
     def write_sheet(wb, df, name):
         ws      = wb.create_sheet(name)
         headers = list(df.columns)
+        eastern_col_idx = None
+        utc_col_idx = None
+        if "Call Date" in headers:
+            utc_col_idx = headers.index("Call Date") + 1
+            headers.insert(utc_col_idx, "Call Date (Eastern Time Zone)")
+            eastern_col_idx = utc_col_idx + 1
+            headers[utc_col_idx + 1:utc_col_idx + 1] = [
+                "Call Date (Eastern Time Zone) Date",
+                "Call Date (Eastern Time Zone) Time",
+                "Call Date (Eastern Time Zone) Month",
+                "Call Date (Eastern Time Zone) Year",
+                "Call Date (Eastern Time Zone) Hour",
+            ]
         ws.append(headers)
         for _, row in df.iterrows():
-            ws.append([sanitize(row[h]) for h in headers])
+            values = [sanitize(row[h]) if h in row else "" for h in headers]
+            ws.append(values)
+            if eastern_col_idx is not None:
+                row_num = ws.max_row
+                utc_cell = f"{get_column_letter(utc_col_idx)}{row_num}"
+                eastern_cell = f"{get_column_letter(eastern_col_idx)}{row_num}"
+                ws.cell(row_num, eastern_col_idx).value = (
+                    f'=IF({utc_cell}="","",DATE(VALUE(LEFT({utc_cell},4)),VALUE(MID({utc_cell},6,2)),VALUE(MID({utc_cell},9,2)))+'
+                    f'TIME(VALUE(MID({utc_cell},12,2)),VALUE(MID({utc_cell},15,2)),VALUE(MID({utc_cell},18,2)))-IF('
+                    f'AND(DATE(VALUE(LEFT({utc_cell},4)),VALUE(MID({utc_cell},6,2)),VALUE(MID({utc_cell},9,2)))+'
+                    f'TIME(VALUE(MID({utc_cell},12,2)),VALUE(MID({utc_cell},15,2)),VALUE(MID({utc_cell},18,2)))>='
+                    f'DATE(VALUE(LEFT({utc_cell},4)),3,1)+MOD(8-WEEKDAY(DATE(VALUE(LEFT({utc_cell},4)),3,1)),7)+7+TIME(7,0,0),'
+                    f'DATE(VALUE(LEFT({utc_cell},4)),3,1)+MOD(8-WEEKDAY(DATE(VALUE(LEFT({utc_cell},4)),3,1)),7)+7+TIME(7,0,0)<'
+                    f'DATE(VALUE(LEFT({utc_cell},4)),11,1)+MOD(8-WEEKDAY(DATE(VALUE(LEFT({utc_cell},4)),11,1)),7)+TIME(6,0,0)), '
+                    f'TIME(4,0,0),TIME(5,0,0)))'
+                )
+                ws.cell(row_num, eastern_col_idx + 1).value = f'=IF({eastern_cell}="","",INT({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 2).value = f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
+                ws.cell(row_num, eastern_col_idx + 3).value = f'=IF({eastern_cell}="","",MONTH({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 4).value = f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 5).value = f'=IF({eastern_cell}="","",HOUR({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx).number_format = "mm/dd/yy hh:mm"
+                ws.cell(row_num, eastern_col_idx + 1).number_format = "mm/dd/yy"
+                ws.cell(row_num, eastern_col_idx + 2).number_format = "hh:mm"
 
 
         fill  = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -645,6 +682,9 @@ def export_to_excel(incidents, client, state_code):
         ws.freeze_panes = "A2"
 
     wb = Workbook()
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
     wb.remove(wb.active)
     write_sheet(wb, df_overview, "Overview")
     write_sheet(wb, df_raw,      "Raw Data")
@@ -655,10 +695,16 @@ def export_to_excel(incidents, client, state_code):
     docs_dir = pathlib.Path.home() / "Documents"
     docs_dir.mkdir(exist_ok=True)
     filename = str(docs_dir / filename)
+    sheets = "Overview, Raw Data" + (", Casualty & Rescue" if not df_casualties.empty else "")
 
+    add_report_sources_sheet(
+        wb,
+        "IncidentPull.py",
+        incident_date_range(incidents),
+        [("State", state_code), ("Included sheets", sheets)],
+    )
     wb.save(filename)
 
-    sheets = "Overview, Raw Data" + (", Casualty & Rescue" if not df_casualties.empty else "")
     print(f"\n✓ Exported: {filename}")
     print(f"  Incidents : {len(incidents)}")
     print(f"  Sheets    : {sheets}")

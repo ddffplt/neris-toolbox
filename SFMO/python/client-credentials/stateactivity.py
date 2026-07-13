@@ -84,8 +84,8 @@ def authenticate():
         Config(
             base_url="https://api.neris.fsri.org/v1",
             grant_type="client_credentials",
-            client_id="********************",
-            client_secret="***************",
+            client_id="ffcc03c8-7a39-448c-b802-307912a1a29a",
+            client_secret="135q1hpi066ZnCyXXE5b2g",
         )
     )
     client._session.verify = False
