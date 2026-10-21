@@ -10,10 +10,11 @@ import openpyxl
 
 
 SAMPLE_DIR = Path(r"C:\Users\ddion\Python Scripts\Sample Output files")
-FIRE_FILE = SAMPLE_DIR / "neris_fire_activity_MA_2026-08-25_20260826_154656.xlsx"
-TYPE_FILE = SAMPLE_DIR / "neris_incident_type_counts_MA_20260819_123153.xlsx"
-MONTH_FILE = SAMPLE_DIR / "neris_monthly_counts_MA_20260813_100250.xlsx"
+FIRE_FILE = SAMPLE_DIR / "neris_fire_activity_MA_2026-04-01_to_2026-08-31_20260910_120038.xlsx"
+TYPE_FILE = SAMPLE_DIR / "neris_incident_type_counts_MA_20260909_130127.xlsx"
+MONTH_FILE = None
 ENTITY_ID = re.compile(r"^FD[A-Za-z0-9]+$")
+NUMBER_FORMAT = '#,##0;(#,##0);-'
 
 
 def values(row):
@@ -61,6 +62,10 @@ def add_sheet(workbook, title, headers, rows, entity_name, entity_id):
     worksheet.append(headers)
     for row in rows:
         worksheet.append(row)
+    for row in worksheet.iter_rows(min_row=4):
+        for cell in row:
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = NUMBER_FORMAT
     worksheet.freeze_panes = "A4"
     for cell in worksheet[3]:
         cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
@@ -113,13 +118,15 @@ def add_fire_sheet(workbook, source_worksheet, block, entity_name, entity_id):
     return worksheet
 
 
-def add_sources_sheet(workbook, entity_name, entity_id):
+def add_sources_sheet(workbook, entity_name, entity_id, date_range):
     worksheet = workbook.create_sheet("Report Sources")
     worksheet.append([entity_name, entity_id])
     worksheet.append(["Source file", "Date/range information"])
-    worksheet.append([FIRE_FILE.name, "Source filename identifies 2026-08-25"])
-    worksheet.append([TYPE_FILE.name, "Source filename identifies run date 2026-08-19; data range is not encoded"])
-    worksheet.append([MONTH_FILE.name, "Source filename identifies run date 2026-08-13; data range is not encoded"])
+    worksheet.append([FIRE_FILE.name, "Fire activity source workbook"])
+    worksheet.append([TYPE_FILE.name, "Incident type count source workbook"])
+    if MONTH_FILE:
+        worksheet.append([MONTH_FILE.name, "Monthly incident count source workbook"])
+    worksheet.append(["Report date/range", date_range])
     worksheet.append(["Sample note", "This workbook combines only rows belonging to the entity shown above."])
     worksheet.column_dimensions["A"].width = 70
     worksheet.column_dimensions["B"].width = 85
@@ -128,19 +135,22 @@ def add_sources_sheet(workbook, entity_name, entity_id):
         cell.fill = openpyxl.styles.PatternFill("solid", fgColor="1F4E78")
 
 
-def build_reports(output_dir, limit):
+def build_reports(output_dir, limit, requested_ids=None, date_range="Source workbook range"):
     fire_workbook = openpyxl.load_workbook(FIRE_FILE, read_only=False, data_only=False)
     fire_worksheet = fire_workbook.active
     fire_blocks = read_fire_blocks(FIRE_FILE)
     type_headers, type_rows = read_flat_rows(TYPE_FILE, "Incident Type Summary")
     type_month_headers, type_month_rows = read_flat_rows(TYPE_FILE, "Monthly Incident Counts")
-    month_headers, month_rows = read_flat_rows(MONTH_FILE, "Monthly Incident Counts")
     rows_by_entity = {
         "type": {str(row[0]): row for row in type_rows},
         "type_month": {str(row[0]): row for row in type_month_rows},
-        "month": {str(row[0]): row for row in month_rows},
     }
-    entity_ids = sorted(set(fire_blocks) | set(rows_by_entity["type"]) | set(rows_by_entity["month"]))
+    entity_ids = sorted(set(fire_blocks) | set(rows_by_entity["type"]))
+    if requested_ids:
+        missing_ids = sorted(set(requested_ids) - set(entity_ids))
+        if missing_ids:
+            raise ValueError(f"Requested entity IDs were not found: {', '.join(missing_ids)}")
+        entity_ids = [entity_id for entity_id in entity_ids if entity_id in requested_ids]
     if limit:
         entity_ids = entity_ids[:limit]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +159,6 @@ def build_reports(output_dir, limit):
         entity_name = (
             fire_blocks.get(entity_id, ("", [], 0, 0))[0]
             or rows_by_entity["type"].get(entity_id, ["", ""])[1]
-            or rows_by_entity["month"].get(entity_id, ["", ""])[1]
             or entity_id
         )
         workbook = openpyxl.Workbook()
@@ -159,10 +168,9 @@ def build_reports(output_dir, limit):
             add_fire_sheet(workbook, fire_worksheet, fire_block, entity_name, entity_id)
         else:
             add_sheet(workbook, "Fire Activity", [], [], entity_name, entity_id)
-        add_sources_sheet(workbook, entity_name, entity_id)
         add_sheet(workbook, "Incident Types", type_headers, [rows_by_entity["type"][entity_id]], entity_name, entity_id) if entity_id in rows_by_entity["type"] else None
         add_sheet(workbook, "Type Monthly Activity", type_month_headers, [rows_by_entity["type_month"][entity_id]], entity_name, entity_id) if entity_id in rows_by_entity["type_month"] else None
-        add_sheet(workbook, "State Monthly Activity", month_headers, [rows_by_entity["month"][entity_id]], entity_name, entity_id) if entity_id in rows_by_entity["month"] else None
+        add_sources_sheet(workbook, entity_name, entity_id, date_range)
         path = output_dir / f"{safe_name(entity_name)}_{safe_name(entity_id)}_sample.xlsx"
         workbook.save(path)
         print(path)
@@ -172,12 +180,14 @@ def build_reports(output_dir, limit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output-dir", default=r"C:\Users\ddion\Python Scripts\Email\test-email-examples\first-10-reports")
+    parser.add_argument("--entity-id", action="append", dest="entity_ids", help="Include only this NERIS entity ID; repeat for multiple departments.")
+    parser.add_argument("--date-range", default="Source workbook range", help="Date range recorded in each generated workbook.")
     args = parser.parse_args()
-    if args.limit < 1:
+    if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
-    build_reports(Path(args.output_dir), args.limit)
+    build_reports(Path(args.output_dir), args.limit, args.entity_ids, args.date_range)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,19 @@ def ensure_dependencies():
         pip_install("neris-api-client")
         print("✓ neris-api-client installed")
 
+    try:
+        import truststore  # noqa
+    except ImportError:
+        print("Installing truststore...")
+        pip_install("truststore")
+        print("✓ truststore installed")
+
+    # Use the Windows certificate store for TLS verification instead of certifi's
+    # bundle, since OpenSSL 3.x rejects some CA chains (non-critical Basic
+    # Constraints) that Windows/Schannel accepts.
+    import truststore
+    truststore.inject_into_ssl()
+
 DATE_RANGE_OPTIONS = [
     "All Records",
     "Occurred Today",
@@ -51,6 +64,15 @@ DATE_RANGE_OPTIONS = [
     "Custom Date Range",
 ]
 
+FD25_COUNTY_CODES = {f"{number:03d}" for number in range(1, 28, 2)}
+
+
+def normalize_fd25_prefix(value):
+    prefix = (value or "").strip().upper().rstrip("*")
+    if prefix.startswith("FD25") and prefix[4:] in FD25_COUNTY_CODES:
+        return prefix
+    return None
+
 
 def parse_cli_args():
     parser = argparse.ArgumentParser()
@@ -58,6 +80,7 @@ def parse_cli_args():
     parser.add_argument('--password', '-p')
     parser.add_argument('--entity-id', '-e')
     parser.add_argument('--statewide', action='store_true', help='Run statewide (no entity filter), overrides --entity-id if provided')
+    parser.add_argument('--fd25-prefix', help='Run entities matching a county prefix such as FD25001*')
     parser.add_argument('--national', action='store_true', help='Allow nationwide run (no state filter)')
     parser.add_argument('--mfa-code', help='One-time MFA code to supply non-interactively')
     parser.add_argument('--range-type', choices=DATE_RANGE_OPTIONS)
@@ -80,10 +103,35 @@ def prompt_config():
     password = input("> ").strip()
 
     print("\n── Query Parameters ─────────────────────────────")
-    print("Enter a NERIS Entity ID (e.g. FD26163151) to fetch incidents for a single department.")
-    print("Leave blank to fetch incidents for the entire state (no department filter).")
-    entity_id_raw = input("NERIS Entity ID (or leave blank for statewide): ").strip()
-    entity_id = entity_id_raw if entity_id_raw else None
+    print("\nEntity Scope Options:")
+    print("  1. One entity")
+    print("  2. Entities in an FD25 county prefix")
+    print("  3. Entire state")
+    while True:
+        scope_choice = input("Select entity scope [1]: ").strip() or "1"
+        if scope_choice in {"1", "2", "3"}:
+            break
+        print("  Invalid selection, choose 1, 2, or 3.")
+
+    entity_id = None
+    entity_prefix = None
+    entity_scope = "entity"
+    if scope_choice == "1":
+        entity_id = input("NERIS Entity ID (e.g. FD26163151): ").strip()
+        if not entity_id:
+            print("  An entity ID is required for this scope.")
+            return prompt_config()
+    elif scope_choice == "2":
+        while True:
+            entity_prefix = normalize_fd25_prefix(
+                input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")
+            )
+            if entity_prefix:
+                break
+            print("  Invalid prefix. Use FD25 followed by an odd county code from 001 through 027, such as FD25001*.")
+        entity_scope = "fd25_prefix"
+    else:
+        entity_scope = "statewide"
 
     print("\nDate Range Options:")
     for i, opt in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -112,7 +160,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return username, password, entity_id, range_type, start_date, end_date
+    return username, password, entity_id, entity_prefix, entity_scope, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -260,12 +308,14 @@ def get_department_incidents(client, neris_id_entity,
     return all_incidents
 
 
-def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None):
+def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None, entity_prefix=None):
     """Fetch incidents by enumerating entities and aggregating per-entity results.
     This avoids making a single unrestricted 'list_incidents' call which may be forbidden.
     If 'state' is provided, it will be used when listing entities.
+    Returns a tuple of (aggregated_incidents, entity_ids).
     """
-    print("\nAttempting statewide fetch by enumerating entities...")
+    scope_label = f"entities beginning with {entity_prefix}" if entity_prefix else "statewide"
+    print(f"\nAttempting {scope_label} fetch by enumerating entities...")
 
     # First, collect entities the client can query
     entities = []
@@ -292,15 +342,22 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
     except Exception as e:
         print(f"\n✗ Could not enumerate entities: {e}")
         traceback.print_exc()
-        return []
+        return [], []
 
+    if entity_prefix:
+        entities = [
+            entity for entity in entities
+            if str(entity.get('neris_id', '')).startswith(entity_prefix)
+        ]
     print(f"\nFound {len(entities)} entities to query")
 
     aggregated = []
+    all_entity_ids = []
     for ent in entities:
         eid = ent.get('neris_id') if isinstance(ent, dict) else None
         if not eid:
             continue
+        all_entity_ids.append(str(eid))
         print(f"\nQuerying entity {eid} ({ent.get('name','')}) ...")
         incs = get_department_incidents(client, eid, call_create_start=call_create_start, call_create_end=call_create_end, max_incidents=None, page_size=page_size)
         if incs:
@@ -311,16 +368,21 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
             break
 
     print(f"\nTotal aggregated incidents: {len(aggregated)}")
-    return aggregated
+    return aggregated, all_entity_ids
 
-def export_to_excel(incidents, client, department_id=None):
+def export_to_excel(incidents, client, department_id=None, entity_ids=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
+    from summary_sheet_builder import build_summary_metrics, write_summary_sheet
     import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    if not incidents:
+    entity_ids = [str(entity_id) for entity_id in (entity_ids or []) if entity_id]
+    if department_id:
+        entity_ids = [str(department_id)] + [eid for eid in entity_ids if eid != str(department_id)]
+
+    if not incidents and not entity_ids:
         print("⚠ No incidents to export.")
         return None
 
@@ -330,13 +392,37 @@ def export_to_excel(incidents, client, department_id=None):
 
     # Single department name lookup
     dept_name = ""
+    dept_names = {}
     if department_id:
         try:
             entity    = client.get_entity(department_id)
             dept_name = entity.get("name", "")
+            dept_names[department_id] = dept_name
             print(f"Department: {dept_name}")
         except Exception as e:
             print(f"  Could not fetch department name: {e}")
+
+    for dept_id in entity_ids:
+        if dept_id in dept_names:
+            continue
+        try:
+            entity = client.get_entity(dept_id)
+            dept_names[dept_id] = entity.get("name", "") if isinstance(entity, dict) else ""
+        except Exception:
+            dept_names[dept_id] = ""
+
+    dept_ids = {
+        (inc.get("base") or {}).get("department_neris_id")
+        for inc in incidents
+    } - {None, ""}
+    for dept_id in dept_ids - set(dept_names):
+        try:
+            entity = client.get_entity(dept_id)
+            dept_names[dept_id] = entity.get("name", "")
+        except Exception:
+            dept_names[dept_id] = ""
+
+    summary_metrics = build_summary_metrics(incidents, dept_names, entity_ids=entity_ids)
 
     def extract_list_field(lst, key):
         if not lst or not isinstance(lst, list):
@@ -420,6 +506,42 @@ def export_to_excel(incidents, client, department_id=None):
             "Outcome Narrative":    base.get("outcome_narrative", ""),
             "Displacement Count":   base.get("displacement_count", ""),
             "Submitter Type":       inc.get("submitter_account_type", ""),
+        })
+
+        base_loc = base.get("location", {}) or {}
+        base_geo = base_loc.get("geocoded_location", {}) or {}
+        dispatch_loc = dispatch.get("location", {}) or {}
+        dispatch_geo = dispatch_loc.get("geocoded_location", {}) or {}
+        if base_geo and any(base_geo.values()):
+            overview_location = get_location_data(
+                base_geo, base_geo.get("point", {})
+            )
+            overview_location_source = "base_location_geocoded"
+        elif base_loc and any(base_loc.values()):
+            overview_location = get_location_data(base_loc)
+            overview_location_source = "base_location"
+        elif dispatch_geo and any(dispatch_geo.values()):
+            overview_location = get_location_data(
+                dispatch_geo, dispatch_geo.get("point", {})
+            )
+            overview_location_source = "dispatch_location_geocoded"
+        elif dispatch_loc and any(dispatch_loc.values()):
+            overview_location = get_location_data(dispatch_loc)
+            overview_location_source = "dispatch_location"
+        else:
+            overview_location = {}
+            overview_location_source = ""
+
+        overview_rows[-1].update({
+            "Location Source": overview_location_source,
+            "Latitude": overview_location.get("latitude", ""),
+            "Longitude": overview_location.get("longitude", ""),
+            "GIS Point (longitude,latitude)": (
+                f"{overview_location['longitude']},{overview_location['latitude']}"
+                if overview_location.get("longitude", "") != ""
+                and overview_location.get("latitude", "") != ""
+                else ""
+            ),
         })
 
     casualty_detail_rows = []
@@ -516,6 +638,14 @@ def export_to_excel(incidents, client, department_id=None):
         inc["location_source"] = location_source
         for field, value in final_location.items():
             inc[f"location_{field}"] = value
+        inc["location_latitude"] = final_location.get("latitude", "")
+        inc["location_longitude"] = final_location.get("longitude", "")
+        inc["location_gis_point"] = (
+            f"{final_location['longitude']},{final_location['latitude']}"
+            if final_location.get("longitude", "") != ""
+            and final_location.get("latitude", "") != ""
+            else ""
+        )
 
         # Remove original nested location objects to keep json_normalize clean
         base.pop("location", None)
@@ -736,6 +866,7 @@ def export_to_excel(incidents, client, department_id=None):
             "location_county",
             "location_latitude",
             "location_longitude",
+            "location_gis_point",
             "location_census_tract",
             "location_census_block",
             "location_parcel_id",
@@ -760,10 +891,11 @@ def export_to_excel(incidents, client, department_id=None):
 
     df_raw = reorder_columns(df_raw)
 
-    def clean_df(df):
+    def clean_df(df, keep_columns=None):
+        keep_columns = set(keep_columns or [])
         drop = [
             col for col in df.columns
-            if df[col].dropna().pipe(
+            if col not in keep_columns and df[col].dropna().pipe(
                 lambda s: s.empty or s.apply(
                     lambda x: x == "" or x == [] or str(x) == "[]"
                 ).all()
@@ -771,8 +903,20 @@ def export_to_excel(incidents, client, department_id=None):
         ]
         return df.drop(columns=drop)
 
-    df_overview   = clean_df(pd.DataFrame(overview_rows).fillna(""))
-    df_raw        = clean_df(df_raw)
+    df_overview   = clean_df(
+        pd.DataFrame(overview_rows).fillna(""),
+        keep_columns={
+            "Location Source", "Latitude", "Longitude",
+            "GIS Point (longitude,latitude)",
+        },
+    )
+    df_raw        = clean_df(
+        df_raw,
+        keep_columns={
+            "location_source", "location_latitude", "location_longitude",
+            "location_gis_point",
+        },
+    )
     df_casualties = (
         clean_df(pd.DataFrame(casualty_detail_rows).fillna(""))
         if casualty_detail_rows else pd.DataFrame()
@@ -817,7 +961,10 @@ def export_to_excel(incidents, client, department_id=None):
                 )
                 ws.cell(row_num, eastern_col_idx + 1).value = f'=IF({eastern_cell}="","",INT({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 2).value = f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
-                ws.cell(row_num, eastern_col_idx + 3).value = f'=IF({eastern_cell}="","",MONTH({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 3).value = (
+                    f'=IF({eastern_cell}="","",CHOOSE(MONTH({eastern_cell}),'
+                    f'"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))'
+                )
                 ws.cell(row_num, eastern_col_idx + 4).value = f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 5).value = f'=IF({eastern_cell}="","",HOUR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx).number_format = "mm/dd/yy hh:mm"
@@ -849,6 +996,7 @@ def export_to_excel(incidents, client, department_id=None):
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.remove(wb.active)
+    write_summary_sheet(wb, summary_metrics)
     write_sheet(wb, df_overview, "Overview")
     write_sheet(wb, df_raw,      "Raw Data")
     if not df_casualties.empty:
@@ -858,11 +1006,18 @@ def export_to_excel(incidents, client, department_id=None):
         wb,
         "IncidentPull_VegetationFires.py",
         incident_date_range(incidents),
-        [("Included sheets", "Overview, Raw Data, Casualty & Rescue")],
+        [
+            ("Included sheets", "Summary, Overview, Raw Data, Casualty & Rescue"),
+            (
+                "Included incident types",
+                "FIRE||OUTSIDE_FIRE||VEGETATION_GRASS_FIRE; "
+                "WILDLAND_WILDFIRE; WILDLAND_URBAN_INTERFACE",
+            ),
+        ],
     )
     wb.save(filename)
 
-    sheets = "Overview, Raw Data" + (", Casualty & Rescue" if not df_casualties.empty else "")
+    sheets = "Summary, Overview, Raw Data" + (", Casualty & Rescue" if not df_casualties.empty else "")
     print(f"\n✓ Exported: {filename}")
     print(f"  Incidents : {len(incidents)}")
     print(f"  Sheets    : {sheets}")
@@ -874,35 +1029,54 @@ def main():
     args = parse_cli_args()
     cli_used = any([
         args.username, args.password, args.range_type, args.start_date,
-        args.end_date, args.entity_id, args.statewide, args.max_incidents, args.page_size
+        args.end_date, args.entity_id, args.statewide, args.fd25_prefix,
+        args.max_incidents, args.page_size
     ])
 
     if cli_used:
         username = args.username or os.environ.get("NERIS_USERNAME")
         password = args.password or os.environ.get("NERIS_PASSWORD")
-        entity_id = None if args.statewide else (args.entity_id or None)
+        entity_prefix = normalize_fd25_prefix(args.fd25_prefix)
+        if args.fd25_prefix and not entity_prefix:
+            sys.exit("✗ Invalid FD25 prefix. Use FD25 followed by an odd county code from 001 through 027, such as FD25001*.")
+        if entity_prefix:
+            entity_scope = "fd25_prefix"
+            entity_id = None
+        elif args.statewide:
+            entity_scope = "statewide"
+            entity_id = None
+        else:
+            entity_id = args.entity_id or None
+            entity_prefix = None
+            entity_scope = "entity" if entity_id else "statewide"
         range_type = args.range_type or "All Records"
         start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
         end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date() if args.end_date else None
         max_incidents = args.max_incidents
         page_size = args.page_size or 100
     else:
-        username, password, entity_id, range_type, start_date, end_date = prompt_config()
+        (
+            username, password, entity_id, entity_prefix, entity_scope,
+            range_type, start_date, end_date,
+        ) = prompt_config()
         max_incidents = None
         page_size = 100
 
     if not username or not password:
         sys.exit("✗ Email and password are required.")
-    if not entity_id:
+    if entity_scope == "statewide":
         print("No NERIS Entity ID provided — running statewide (no entity filter).")
+    elif entity_scope == "fd25_prefix":
+        print(f"Filtering entities with prefix {entity_prefix}*.")
 
     # If user provided an MFA code via CLI, use it to avoid interactive prompt.
     mfa_code = args.mfa_code if 'args' in locals() else None
     client = authenticate(username, password, mfa_code=mfa_code)
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
+    all_entity_ids = [entity_id] if entity_id else []
 
-    if entity_id:
+    if entity_scope == "entity":
         incidents = get_department_incidents(
             client,
             entity_id,
@@ -921,21 +1095,32 @@ def main():
             else:
                 state_param = args.state
 
-        # Default to Massachusetts (MA) when no state is provided and national not requested
-        if state_param is None and not ('args' in locals() and getattr(args, 'national', False)):
+        # Default to Massachusetts for the full statewide interactive run.
+        if (
+            state_param is None
+            and entity_scope == "statewide"
+            and not ('args' in locals() and getattr(args, 'national', False))
+        ):
             state_param = 'MA'
             print("No state specified — defaulting to MA (Massachusetts) for statewide run.")
 
-        incidents = get_statewide_incidents(
+        incidents, all_entity_ids = get_statewide_incidents(
             client,
             call_create_start=start_filter,
             call_create_end=end_filter,
             max_incidents=max_incidents,
             page_size=page_size,
             state=state_param,
+            entity_prefix=entity_prefix if entity_scope == "fd25_prefix" else None,
         )
 
-    # Filter to incident types that contain Structure Fire in any type field.
+    vegetation_incident_types = {
+        "FIRE||OUTSIDE_FIRE||VEGETATION_GRASS_FIRE",
+        "WILDLAND_WILDFIRE",
+        "WILDLAND_URBAN_INTERFACE",
+    }
+
+    # Filter to the approved vegetation types, whether primary or secondary.
     def incident_matches_filter(inc):
         inc_types = inc.get("incident_types", []) or []
         type_values = []
@@ -946,18 +1131,17 @@ def main():
                     type_values.append(t)
             elif isinstance(it, str):
                 type_values.append(it)
-        return any("STRUCTURE_FIRE" in t for t in type_values)
+        return any(t in vegetation_incident_types for t in type_values)
 
     total_before = len(incidents)
     filtered_incidents = [inc for inc in incidents if incident_matches_filter(inc)]
     incidents = filtered_incidents
-    print(f"\nFiltered incidents: {len(incidents)} of {total_before} contain Structure Fire in an incident type.")
+    print(f"\nFiltered incidents: {len(incidents)} of {total_before} contain an approved vegetation incident type.")
 
     if not incidents:
-        print("⚠ No incidents found for the given parameters (after filtering to Structure Fire types).")
-        return
+        print("⚠ No incidents found for the given parameters (after filtering to approved vegetation incident types).")
 
-    export_to_excel(incidents, client, department_id=entity_id)
+    export_to_excel(incidents, client, department_id=entity_id, entity_ids=all_entity_ids)
 
     print("\n" + "=" * 60)
     print("  PROCESS COMPLETE")

@@ -9,6 +9,7 @@ from pathlib import Path
 import openpyxl
 
 ENTITY_ID = re.compile(r"^FD[A-Za-z0-9]+$")
+NUMBER_FORMAT = '#,##0;(#,##0);-'
 
 
 def safe_name(value):
@@ -60,9 +61,8 @@ def read_rows(path, sheet_name):
     return headers, entity_rows
 
 
-def read_fire_blocks(path):
-    workbook = openpyxl.load_workbook(path, read_only=False, data_only=False)
-    worksheet = workbook["Entity Fire Reports"]
+def read_entity_blocks(worksheet):
+    """Split a worksheet into per-entity row ranges, keyed by entity ID heading rows."""
     blocks = {}
     current_id = None
     current_name = ""
@@ -78,11 +78,23 @@ def read_fire_blocks(path):
             current_start = row_number
     if current_id:
         blocks[current_id] = (current_name, current_start, worksheet.max_row)
-    return workbook, worksheet, blocks
+    return blocks
 
 
-def add_fire_sheet(workbook, source_worksheet, block):
-    worksheet = workbook.create_sheet("Fire Activity")
+def load_entity_blocks(path, sheet_name):
+    workbook = openpyxl.load_workbook(path, read_only=False, data_only=False)
+    if sheet_name not in workbook.sheetnames:
+        return workbook, None, {}
+    worksheet = workbook[sheet_name]
+    return workbook, worksheet, read_entity_blocks(worksheet)
+
+
+def read_fire_blocks(path):
+    return load_entity_blocks(path, "Entity Fire Reports")
+
+
+def add_block_sheet(workbook, title, source_worksheet, block):
+    worksheet = workbook.create_sheet(title[:31])
     _, start_row, end_row = block
     offset = 1 - start_row
     for source_row in range(start_row, end_row + 1):
@@ -121,6 +133,10 @@ def add_table(workbook, title, headers, rows, entity_name, entity_id):
     worksheet.append(headers)
     for row in rows:
         worksheet.append(row)
+    for row in worksheet.iter_rows(min_row=4):
+        for cell in row:
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = NUMBER_FORMAT
     worksheet.freeze_panes = "A4"
     for cell in worksheet[3]:
         cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
@@ -153,6 +169,8 @@ def classify_files(files):
         sheets = set(workbook.sheetnames)
         if "Entity Fire Reports" in sheets:
             category = "fire"
+        elif "Entity Aid Reports" in sheets:
+            category = "aid"
         elif "Incident Type Summary" in sheets:
             category = "types"
         elif "Monthly Incident Counts" in sheets:
@@ -172,6 +190,11 @@ def build_reports(files, output_folder):
     classified = classify_files(files)
     fire_path = classified["fire"]
     fire_workbook, fire_worksheet, fire_blocks = read_fire_blocks(fire_path)
+    aid_entity_blocks = aid_lieu_blocks = {}
+    aid_entity_worksheet = aid_lieu_worksheet = None
+    if "aid" in classified:
+        _, aid_entity_worksheet, aid_entity_blocks = load_entity_blocks(classified["aid"], "Entity Aid Reports")
+        _, aid_lieu_worksheet, aid_lieu_blocks = load_entity_blocks(classified["aid"], "Aid Given In Lieu Of")
     type_headers, type_rows = read_rows(classified["types"], "Incident Type Summary") if "types" in classified else (None, [])
     type_month_headers, type_month_rows = read_rows(classified["types"], "Monthly Incident Counts") if "types" in classified else (None, [])
     month_headers, month_rows = read_rows(classified["monthly"], "Monthly Incident Counts") if "monthly" in classified else (None, [])
@@ -180,23 +203,36 @@ def build_reports(files, output_folder):
         "type_month": {str(row[0]): row for row in type_month_rows},
         "monthly": {str(row[0]): row for row in month_rows},
     }
-    entity_ids = sorted(set(fire_blocks) | set(rows_by_entity["types"]) | set(rows_by_entity["monthly"]))
+    entity_ids = sorted(
+        set(fire_blocks) | set(rows_by_entity["types"]) | set(rows_by_entity["monthly"])
+        | set(aid_entity_blocks) | set(aid_lieu_blocks)
+    )
     output_folder.mkdir(parents=True, exist_ok=True)
 
     for entity_id in entity_ids:
         entity_name = fire_blocks.get(entity_id, ("", None, None))[0]
-        entity_name = entity_name or rows_by_entity["types"].get(entity_id, ["", entity_id])[1] or entity_id
+        entity_name = (
+            entity_name
+            or rows_by_entity["types"].get(entity_id, ["", entity_id])[1]
+            or aid_entity_blocks.get(entity_id, ("", None, None))[0]
+            or aid_lieu_blocks.get(entity_id, ("", None, None))[0]
+            or entity_id
+        )
         workbook = openpyxl.Workbook()
         workbook.remove(workbook.active)
         fire_block = fire_blocks.get(entity_id)
         if fire_block:
-            add_fire_sheet(workbook, fire_worksheet, fire_block)
+            add_block_sheet(workbook, "Fire Activity", fire_worksheet, fire_block)
+        aid_block = aid_entity_blocks.get(entity_id)
+        if aid_block:
+            add_block_sheet(workbook, "Entity Aid Reports", aid_entity_worksheet, aid_block)
+        lieu_block = aid_lieu_blocks.get(entity_id)
+        if lieu_block:
+            add_block_sheet(workbook, "Aid Given In Lieu Of", aid_lieu_worksheet, lieu_block)
         if "types" in classified and entity_id in rows_by_entity["types"]:
             add_table(workbook, "Incident Types", type_headers, [rows_by_entity["types"][entity_id]], entity_name, entity_id)
         if "types" in classified and entity_id in rows_by_entity["type_month"]:
             add_table(workbook, "Type Monthly Activity", type_month_headers, [rows_by_entity["type_month"][entity_id]], entity_name, entity_id)
-        if "monthly" in classified and entity_id in rows_by_entity["monthly"]:
-            add_table(workbook, "State Monthly Activity", month_headers, [rows_by_entity["monthly"][entity_id]], entity_name, entity_id)
         add_sources_sheet(workbook, entity_name, entity_id, sorted(classified.items()))
         path = output_folder / f"{safe_name(entity_name)}_{safe_name(entity_id)}_combined.xlsx"
         workbook.save(path)

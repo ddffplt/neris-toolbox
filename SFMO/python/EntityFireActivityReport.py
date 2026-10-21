@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+# pyright: reportMissingImports=false
 """NERIS fire activity report by entity and fire incident type."""
 
 import os
 import subprocess
 import sys
+import time
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -33,21 +35,26 @@ SUMMARY_GROUPS = {
     "Outside Fires": "OUTSIDE_FIRE",
 }
 
+# NERIS API aid_type enum values are ACTING_AS_AID / IN_LIEU_AID / SUPPORT_AID (not *_OF/ACTING_AS).
 AID_COLUMNS = {
-    ("GIVEN", "IN_SUPPORT_OF"): "Aid Given In Support of",
-    ("GIVEN", "IN_LIEU_OF"): "Aid Given In Lieu of",
-    ("GIVEN", "ACTING_AS"): "Aid Given Acting As",
-    ("RECEIVED", "IN_SUPPORT_OF"): "Aid Received In Support of",
-    ("RECEIVED", "IN_LIEU_OF"): "Aid Received In Lieu of",
-    ("RECEIVED", "ACTING_AS"): "Aid Received Acting As",
+    ("GIVEN", "SUPPORT_AID"): "Aid Given In Support of",
+    ("GIVEN", "IN_LIEU_AID"): "Aid Given In Lieu of",
+    ("GIVEN", "ACTING_AS_AID"): "Aid Given Acting As",
+    ("RECEIVED", "SUPPORT_AID"): "Aid Received In Support of",
+    ("RECEIVED", "IN_LIEU_AID"): "Aid Received In Lieu of",
+    ("RECEIVED", "ACTING_AS_AID"): "Aid Received Acting As",
 }
 
 
 def ensure_dependencies():
     try:
-        import openpyxl  # noqa: F401
+        import openpyxl  # type: ignore[import-not-found]  # noqa: F401
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", "openpyxl", "--quiet"], check=True)
+    try:
+        from neris_api_client import Config, NerisApiClient  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "neris-api-client", "--quiet"], check=True)
 
 
 def prompt_config():
@@ -58,7 +65,10 @@ def prompt_config():
     print("NERIS Password (note: characters will be visible):")
     password = input("> ").strip()
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
-    entity_id = input("NERIS Entity ID (optional): ").strip() or None
+    entity_prefix = input("Entity ID prefix filter (optional, e.g. FD25025): ").strip() or None
+    entity_id = None
+    if not entity_prefix:
+        entity_id = input("NERIS Entity ID (optional): ").strip() or None
 
     print("\nDate Range Options:")
     for number, option in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -89,7 +99,7 @@ def prompt_config():
 
     if not username or not password or not state_code:
         sys.exit("Email, password, and state code are required.")
-    return username, password, state_code, entity_id, range_type, start_date, end_date
+    return username, password, state_code, entity_id, entity_prefix, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -138,9 +148,14 @@ def authenticate(username, password):
         "NERIS_USERNAME": username,
         "NERIS_PASSWORD": password,
     })
-    from neris_api_client import NerisApiClient
+    from neris_api_client import Config, NerisApiClient  # type: ignore[import-not-found]
     print("\nConnecting to NERIS API...")
-    client = NerisApiClient()
+    client = NerisApiClient(Config(
+        base_url="https://api.neris.fsri.org/v1",
+        grant_type="password",
+        username=username,
+        password=password,
+    ))
     print("\nCHECK YOUR EMAIL FOR THE MFA CODE")
     client.list_incidents(page_size=1)
     print("Authentication successful!")
@@ -151,6 +166,8 @@ def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_si
     incidents = []
     cursor = None
     cursor_only = False
+    retries = 0
+    max_retries = 5
     while True:
         if cursor_only:
             params = {"cursor": cursor, "page_size": page_size}
@@ -165,19 +182,22 @@ def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_si
         try:
             response = client.list_incidents(**params)
             status_code = getattr(response, "status_code", None)
-            if status_code == 403:
-                if cursor and not cursor_only:
-                    print("  API rejected the continuation cursor with filters; retrying with cursor only.")
-                    cursor_only = True
-                    continue
-                raise RuntimeError(
-                    f"NERIS API returned HTTP 403 while retrieving incidents for {entity_id}. "
-                    "The account may not have access to this entity or cursor."
-                )
+            # 401/403 from the gateway (HTML body) are often throttling or an expiring token, so retry them too.
+            if status_code is not None and (status_code >= 500 or status_code in (401, 403)):
+                retries += 1
+                if retries > max_retries:
+                    raise RuntimeError(
+                        f"NERIS API returned HTTP {status_code} for {entity_id} after {max_retries} retries."
+                    )
+                wait = 5 * 2 ** (retries - 1)
+                print(f"  HTTP {status_code}; retry {retries}/{max_retries} in {wait}s...")
+                time.sleep(wait)
+                continue
+            retries = 0
             response = response if isinstance(response, dict) else response.json()
         except Exception as error:
             status_code = getattr(getattr(error, "response", None), "status_code", None)
-            if isinstance(error, RuntimeError) and str(error).startswith("NERIS API returned HTTP 403"):
+            if isinstance(error, RuntimeError) and str(error).startswith("NERIS API returned HTTP"):
                 raise
             raise RuntimeError(
                 f"Unable to retrieve incidents for {entity_id}"
@@ -349,9 +369,9 @@ def aggregate(incidents, entity_names):
 
 def export_excel(detail, detail_types, summary, summary_types, entity_names, state_code,
                  range_label="selected-range"):
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
+    from openpyxl import Workbook  # type: ignore[import-not-found]
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # type: ignore[import-not-found]
+    from openpyxl.utils import get_column_letter  # type: ignore[import-not-found]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(
@@ -366,11 +386,73 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
     border = Border(*(Side(style="thin", color="B7C9D6") for _ in range(4)))
     heading_border = Border(*(Side(style="thin", color="000000") for _ in range(4)))
     sheet = workbook.create_sheet("Entity Fire Reports")
+    summary_sheet = workbook.create_sheet("Summary")
     headers_by_table = {
         "detail": ["Fire Incident Type"] + METRIC_COLUMNS,
         "summary": ["Fire Summary Type"] + METRIC_COLUMNS,
     }
     currency_columns = {"Property Value Loss", "Contents Value Loss", "Total Loss"}
+
+    def style_header_row(target_sheet, row_number):
+        for cell in target_sheet[row_number]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+    summary_headers = ["Entity ID", "Department Name"] + METRIC_COLUMNS
+    summary_sheet.append(summary_headers)
+    style_header_row(summary_sheet, summary_sheet.max_row)
+    for entity_id in sorted(set(entity_names) | {key[0] for key in summary}):
+        entity_name = entity_names.get(entity_id, "")
+        total_values = {column: 0 for column in METRIC_COLUMNS}
+        for label in SUMMARY_GROUPS:
+            key = (entity_id, label)
+            if key not in summary:
+                continue
+            for column in METRIC_COLUMNS:
+                total_values[column] += summary[key][column]
+        row = [entity_id, entity_name]
+        for column in METRIC_COLUMNS:
+            value = total_values[column]
+            if column == "Acres Burned":
+                value = math.ceil((value - 1e-12) * 100) / 100
+            row.append(value)
+        summary_sheet.append(row)
+        for column_index, column in enumerate(summary_headers, 1):
+            cell = summary_sheet.cell(summary_sheet.max_row, column_index)
+            cell.border = border
+            if column in currency_columns:
+                cell.number_format = '$#,##0;($#,##0);-'
+            elif column == "Acres Burned":
+                cell.number_format = '#,##0.00;(#,##0.00);-'
+            elif column in METRIC_COLUMNS:
+                cell.number_format = '#,##0;(#,##0);-'
+
+    for row_number in range(1, summary_sheet.max_row + 1):
+        if summary_sheet.cell(row_number, 1).value in ("Entity ID",):
+            summary_sheet.row_dimensions[row_number].height = 48
+
+    for column_index in range(1, len(summary_headers) + 1):
+        column_letter = get_column_letter(column_index)
+        longest_value = 0
+        for row_number in range(1, summary_sheet.max_row + 1):
+            cell = summary_sheet.cell(row_number, column_index)
+            if cell.value is None:
+                continue
+            if column_index <= 2:
+                value_length = len(str(cell.value))
+            else:
+                if cell.number_format == '$#,##0;($#,##0);-':
+                    value_length = len(f"${round(float(cell.value or 0)):,.0f}")
+                elif cell.number_format == '#,##0.00;(#,##0.00);-':
+                    value_length = len(f"{float(cell.value or 0):,.2f}")
+                elif cell.number_format == '#,##0;(#,##0);-':
+                    value_length = len(f"{round(float(cell.value or 0)):,}")
+                else:
+                    value_length = len(str(cell.value))
+            longest_value = max(longest_value, value_length)
+        summary_sheet.column_dimensions[column_letter].width = max(10, min(longest_value + 2, 40))
 
     def append_table(data, type_sets, type_header, entity_id):
         headers = headers_by_table[type_header]
@@ -381,13 +463,13 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = border
-        for key in sorted(data):
-            if key[0] != entity_id:
-                continue
-            _, type_name = key
+        table_rows = [key for key in sorted(data) if key[0] == entity_id]
+        totals = {column: 0 for column in METRIC_COLUMNS}
+
+        def append_data_row(type_name, values):
             row = [type_name]
             for column in METRIC_COLUMNS:
-                value = data[key][column]
+                value = values[column]
                 if column == "Acres Burned":
                     value = math.ceil((value - 1e-12) * 100) / 100
                 row.append(value)
@@ -401,6 +483,17 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
                     cell.number_format = '#,##0.00;(#,##0.00);-'
                 elif column in METRIC_COLUMNS:
                     cell.number_format = '#,##0;(#,##0);-'
+
+        for key in table_rows:
+            append_data_row(key[1], data[key])
+            for column in METRIC_COLUMNS:
+                totals[column] += data[key][column]
+
+        append_data_row("Total", totals)
+        total_row = sheet.max_row
+        for cell in sheet[total_row]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="E2F0D9")
 
     entity_ids = sorted(set(entity_names) | {key[0] for key in detail} | {key[0] for key in summary})
     for entity_index, entity_id in enumerate(entity_ids):
@@ -462,20 +555,50 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
                 value_length = 0
             longest_value = max(longest_value, value_length)
         sheet.column_dimensions[column_letter].width = max(8, min(longest_value + 2, 40))
+    from report_metadata import add_report_sources_sheet
+
+    add_report_sources_sheet(
+        workbook,
+        "EntityFireActivityReport.py",
+        range_label,
+        [
+            ("State code", state_code),
+            ("Included sheets", "Entity Fire Reports, Summary"),
+            ("Summary scope", "One total-fires row per department"),
+        ],
+    )
+
     workbook.save(path)
     return path
 
 
 def main():
     ensure_dependencies()
-    username, password, state_code, entity_id, range_type, start_date, end_date = prompt_config()
+    username, password, state_code, entity_id, entity_prefix, range_type, start_date, end_date = prompt_config()
     start, end = calculate_date_range(range_type, start_date, end_date)
     client = authenticate(username, password)
     entity_names = fetch_entities(client, state_code, entity_id)
+    if entity_prefix:
+        entity_prefix = entity_prefix.upper()
+        entity_names = {
+            eid: name for eid, name in entity_names.items()
+            if str(eid).upper().startswith(entity_prefix)
+        }
+    if entity_id:
+        entity_names = {
+            eid: name for eid, name in entity_names.items()
+            if str(eid) == str(entity_id)
+        }
     incidents = []
     for current_entity in entity_names:
         print(f"Fetching {current_entity}...")
-        incidents.extend(fetch_incidents(client, state_code, current_entity, start, end))
+        try:
+            incidents.extend(fetch_incidents(client, state_code, current_entity, start, end))
+        except RuntimeError as error:
+            if "HTTP 403" in str(error):
+                print(f"  Skipping {current_entity}: account is not authorized to retrieve this entity.")
+                continue
+            raise
     detail, detail_types, summary, summary_types, entity_names = aggregate(incidents, entity_names)
     if not entity_names:
         print("No departments found for the selected state/entity.")

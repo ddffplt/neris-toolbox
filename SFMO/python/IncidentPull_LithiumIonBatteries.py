@@ -145,7 +145,7 @@ def calculate_date_range(range_type, start_date=None, end_date=None):
     elif range_type == "Occurred Last 90 Days":
         return today - timedelta(days=90), None
     elif range_type == "Occurred in current calendar year to date":
-        return datetime(now.year, 1, 1, 0, 0, 0, tzinfo=timezone.utc), None
+        return datetime(now.year, 1, 1, 0, 0, 0, tzinfo=timezone.utc), now
     elif range_type.startswith("Occurred in "):
         year = int(range_type.split()[-1])
         return (
@@ -160,6 +160,31 @@ def calculate_date_range(range_type, start_date=None, end_date=None):
         return start_dt, end_dt
 
     return None, None
+
+
+def filter_incidents_by_date(incidents, start=None, end=None):
+    """Filter incidents locally using their dispatch call-create timestamp."""
+    if not start and not end:
+        return incidents
+
+    filtered = []
+    for incident in incidents:
+        dispatch = incident.get("dispatch", {}) or {}
+        timestamp = dispatch.get("call_create") or dispatch.get("call_create_start")
+        if not timestamp:
+            continue
+        try:
+            occurred_at = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            if occurred_at.tzinfo is None:
+                occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if start and occurred_at < start:
+            continue
+        if end and occurred_at > end:
+            continue
+        filtered.append(incident)
+    return filtered
 
 def authenticate(username, password, mfa_code=None):
     os.environ["NERIS_BASE_URL"]   = "https://api.neris.fsri.org/v1"
@@ -210,9 +235,9 @@ def get_department_incidents(client, neris_id_entity,
         print("\nFetching incidents for the entire state (no entity filter)")
 
     if call_create_start:
-        print(f"  call_create >= {call_create_start:%Y-%m-%d %H:%M:%S}")
+        print(f"  local call_create >= {call_create_start:%Y-%m-%d %H:%M:%S}")
     if call_create_end:
-        print(f"  call_create <= {call_create_end:%Y-%m-%d %H:%M:%S}")
+        print(f"  local call_create <= {call_create_end:%Y-%m-%d %H:%M:%S}")
     if not call_create_start and not call_create_end:
         print("  No date filter — retrieving all records")
 
@@ -225,8 +250,6 @@ def get_department_incidents(client, neris_id_entity,
             kwargs["neris_id_entity"] = neris_id_entity
         if state:
             kwargs["state"] = state
-        if call_create_start: kwargs["call_create_start"] = call_create_start
-        if call_create_end:   kwargs["call_create_end"]   = call_create_end
         if next_cursor:       kwargs["cursor"]             = next_cursor
 
         try:
@@ -268,6 +291,7 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
 
     entities = []
     entity_ids = set()
+    all_entity_ids = []
     entity_prefix = "FD25" if state and state.upper() == "MA" else None
     page_number = 1
     try:
@@ -293,12 +317,13 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
                 break
             entities.extend(new_entities)
             entity_ids.update(entity.get('neris_id') for entity in new_entities)
+            all_entity_ids.extend(str(entity.get('neris_id')) for entity in new_entities)
             print(f"  Retrieved {len(new_entities)} entities (total so far: {len(entities)})")
             page_number += 1
     except Exception as e:
         print(f"\n✗ Could not enumerate entities: {e}")
         traceback.print_exc()
-        return []
+        return [], []
 
     print(f"\nFound {len(entities)} entities to query")
 
@@ -317,9 +342,9 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
             break
 
     print(f"\nTotal aggregated incidents: {len(aggregated)}")
-    return aggregated
+    return aggregated, all_entity_ids
 
-def export_to_excel(incidents, client, department_id=None, range_type=None, start_date=None, end_date=None):
+def export_to_excel(incidents, client, department_id=None, range_type=None, start_date=None, end_date=None, entity_ids=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
     import pandas as pd
     from openpyxl import Workbook
@@ -826,6 +851,7 @@ def main():
     client = authenticate(username, password, mfa_code=mfa_code)
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
+    all_entity_ids = [entity_id] if entity_id else []
 
     if entity_id:
         incidents = get_department_incidents(
@@ -858,6 +884,13 @@ def main():
             state=state_param,
         )
 
+    fetched_before_date_filter = len(incidents)
+    incidents = filter_incidents_by_date(incidents, start_filter, end_filter)
+    print(
+        f"\nDate-filtered incidents: {len(incidents)} of "
+        f"{fetched_before_date_filter} fall within the requested range."
+    )
+
     # Get fire cause filter requirements from CLI args
     require_structure = getattr(args, 'require_structure_battery', False) if 'args' in locals() else False
     require_outside = getattr(args, 'require_outside_battery', False) if 'args' in locals() else False
@@ -883,9 +916,8 @@ def main():
 
     if not incidents:
         print("⚠ No incidents found matching lithium-ion battery fire criteria.")
-        return
 
-    export_to_excel(incidents, client, department_id=entity_id, range_type=range_type, start_date=start_date, end_date=end_date)
+    export_to_excel(incidents, client, department_id=entity_id, range_type=range_type, start_date=start_date, end_date=end_date, entity_ids=all_entity_ids)
 
     print("\n" + "=" * 60)
     print("  PROCESS COMPLETE")

@@ -30,7 +30,7 @@ def load_client_state_report():
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state", required=True, help="Two-letter state code")
+    parser.add_argument("--state", help="Two-letter state code; prompted when omitted")
     parser.add_argument("--entity", help="Only process this NERIS entity ID")
     parser.add_argument("--start", help="UTC start date, YYYY-MM-DD")
     parser.add_argument("--end", help="UTC end date, YYYY-MM-DD")
@@ -169,6 +169,8 @@ def send_report(sender, recipients, subject, body, attachment):
 
 def main():
     args = parse_args()
+    if not args.state:
+        args.state = input("State Code (e.g. VA, MI, CA): ").strip().upper()
     if len(args.state) != 2:
         raise ValueError("--state must be a two-letter state code")
     start, end = get_date_range(args)

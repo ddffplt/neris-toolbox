@@ -264,11 +264,13 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
     """Fetch incidents by enumerating entities and aggregating per-entity results.
     This avoids making a single unrestricted 'list_incidents' call which may be forbidden.
     If 'state' is provided, it will be used when listing entities.
+    Returns a tuple of (aggregated_incidents, entity_ids).
     """
     print("\nAttempting statewide fetch by enumerating entities...")
 
     # First, collect entities the client can query
     entities = []
+    all_entity_ids = []
     page_number = 1
     try:
         while True:
@@ -292,7 +294,7 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
     except Exception as e:
         print(f"\n✗ Could not enumerate entities: {e}")
         traceback.print_exc()
-        return []
+        return [], []
 
     print(f"\nFound {len(entities)} entities to query")
 
@@ -301,6 +303,7 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
         eid = ent.get('neris_id') if isinstance(ent, dict) else None
         if not eid:
             continue
+        all_entity_ids.append(str(eid))
         print(f"\nQuerying entity {eid} ({ent.get('name','')}) ...")
         incs = get_department_incidents(client, eid, call_create_start=call_create_start, call_create_end=call_create_end, max_incidents=None, page_size=page_size)
         if incs:
@@ -311,16 +314,20 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
             break
 
     print(f"\nTotal aggregated incidents: {len(aggregated)}")
-    return aggregated
+    return aggregated, all_entity_ids
 
-def export_to_excel(incidents, client, department_id=None):
+def export_to_excel(incidents, client, department_id=None, entity_ids=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
     import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
-    if not incidents:
+    entity_ids = [str(entity_id) for entity_id in (entity_ids or []) if entity_id]
+    if department_id:
+        entity_ids = [str(department_id)] + [eid for eid in entity_ids if eid != str(department_id)]
+
+    if not incidents and not entity_ids:
         print("⚠ No incidents to export.")
         return None
 
@@ -817,7 +824,10 @@ def export_to_excel(incidents, client, department_id=None):
                 )
                 ws.cell(row_num, eastern_col_idx + 1).value = f'=IF({eastern_cell}="","",INT({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 2).value = f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
-                ws.cell(row_num, eastern_col_idx + 3).value = f'=IF({eastern_cell}="","",MONTH({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 3).value = (
+                    f'=IF({eastern_cell}="","",CHOOSE(MONTH({eastern_cell}),'
+                    f'"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))'
+                )
                 ws.cell(row_num, eastern_col_idx + 4).value = f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 5).value = f'=IF({eastern_cell}="","",HOUR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx).number_format = "mm/dd/yy hh:mm"
@@ -901,6 +911,7 @@ def main():
     client = authenticate(username, password, mfa_code=mfa_code)
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
+    all_entity_ids = [entity_id] if entity_id else []
 
     if entity_id:
         incidents = get_department_incidents(
@@ -926,7 +937,7 @@ def main():
             state_param = 'MA'
             print("No state specified — defaulting to MA (Massachusetts) for statewide run.")
 
-        incidents = get_statewide_incidents(
+        incidents, all_entity_ids = get_statewide_incidents(
             client,
             call_create_start=start_filter,
             call_create_end=end_filter,
@@ -963,9 +974,8 @@ def main():
 
     if not incidents:
         print("⚠ No incidents found for the given parameters (after filtering to residential Structure Fire types).")
-        return
 
-    export_to_excel(incidents, client, department_id=entity_id)
+    export_to_excel(incidents, client, department_id=entity_id, entity_ids=all_entity_ids)
 
     print("\n" + "=" * 60)
     print("  PROCESS COMPLETE")

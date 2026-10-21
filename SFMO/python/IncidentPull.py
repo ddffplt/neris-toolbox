@@ -657,7 +657,10 @@ def export_to_excel(incidents, client, state_code):
                 )
                 ws.cell(row_num, eastern_col_idx + 1).value = f'=IF({eastern_cell}="","",INT({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 2).value = f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
-                ws.cell(row_num, eastern_col_idx + 3).value = f'=IF({eastern_cell}="","",MONTH({eastern_cell}))'
+                ws.cell(row_num, eastern_col_idx + 3).value = (
+                    f'=IF({eastern_cell}="","",CHOOSE(MONTH({eastern_cell}),'
+                    f'"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))'
+                )
                 ws.cell(row_num, eastern_col_idx + 4).value = f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx + 5).value = f'=IF({eastern_cell}="","",HOUR({eastern_cell}))'
                 ws.cell(row_num, eastern_col_idx).number_format = "mm/dd/yy hh:mm"

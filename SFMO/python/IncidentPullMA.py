@@ -278,7 +278,11 @@ def export_to_excel(incidents, client, state_code):
     ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
     def sanitize(val):
-        return ILLEGAL_CHARS_RE.sub("", val) if isinstance(val, str) else val
+        if isinstance(val, str):
+            return ILLEGAL_CHARS_RE.sub("", val)
+        if isinstance(val, (list, tuple, set, dict)):
+            return ILLEGAL_CHARS_RE.sub("", ", ".join(map(str, val)) if not isinstance(val, dict) else str(val))
+        return val
 
     # ── Overview sheet ────────────────────────────────────────────────────────
 
@@ -670,7 +674,8 @@ def export_to_excel(incidents, client, state_code):
                     f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
                 )
                 ws.cell(row_num, eastern_col_idx + 3).value = (
-                    f'=IF({eastern_cell}="","",MONTH({eastern_cell}))'
+                    f'=IF({eastern_cell}="","",CHOOSE(MONTH({eastern_cell}),'
+                    f'"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))'
                 )
                 ws.cell(row_num, eastern_col_idx + 4).value = (
                     f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'

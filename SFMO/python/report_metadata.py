@@ -1,8 +1,9 @@
+# pyright: reportMissingImports=false
 from datetime import datetime
 
 
 def add_report_sources_sheet(workbook, report_name, date_range, details):
-    from openpyxl.styles import Font
+    from openpyxl.styles import Font  # type: ignore[import-not-found]
 
     worksheet = workbook.create_sheet("Report Sources")
     worksheet.append(["Report source", report_name])
