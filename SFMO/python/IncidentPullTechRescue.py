@@ -597,6 +597,7 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
                     entity_names=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
     import pandas as pd
+    import pathlib
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
@@ -709,6 +710,27 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
             "parcel_id":     "",
         }
 
+    is_massachusetts = str(state_code or "").upper() == "MA"
+    department_identifiers = {}
+    if is_massachusetts:
+        lookup_path = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "MA Departments with State Regional District & Team Identifiers.xlsx"
+        )
+        lookup_df = pd.read_excel(
+            lookup_path,
+            usecols=["NERIS ID", "County", "Tech-Rescue Team"],
+            dtype={"NERIS ID": "string"},
+        ).fillna("")
+        department_identifiers = {
+            str(row["NERIS ID"]).strip().upper(): {
+                "County": row["County"],
+                "Tech-Rescue Team": row["Tech-Rescue Team"],
+            }
+            for _, row in lookup_df.iterrows()
+            if str(row["NERIS ID"]).strip()
+        }
+
     ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
     def sanitize(val):
@@ -722,6 +744,9 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
         dispatch   = inc.get("dispatch", {}) or {}
         status_obj = inc.get("incident_status", {}) or {}
         dept_id    = base.get("department_neris_id", "")
+        department_info = department_identifiers.get(
+            str(dept_id or "").strip().upper(), {}
+        )
 
         inc_types = inc.get("incident_types", []) or []
         type_list = [
@@ -738,6 +763,8 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
             "Incident NERIS ID":    inc.get("neris_id", ""),
             "Department/Entity ID": dept_id,
             "Department Name":      dept_names.get(dept_id, ""),
+            "County":               department_info.get("County", ""),
+            "Tech-Rescue Team":     department_info.get("Tech-Rescue Team", ""),
             "Incident Number":      base.get("incident_number", ""),
             "Call Date":            dispatch.get("call_create", ""),
             "Last Modified":        inc.get("last_modified", ""),
@@ -762,9 +789,14 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
         base     = inc.get("base", {}) or {}
         dispatch = inc.get("dispatch", {}) or {}
         dept_id  = base.get("department_neris_id", "")
+        department_info = department_identifiers.get(
+            str(dept_id or "").strip().upper(), {}
+        )
 
         inc["department_name"]      = dept_names.get(dept_id, "")
         inc["department_neris_id"]  = dept_id
+        inc["County"]               = department_info.get("County", "")
+        inc["Tech-Rescue Team"]     = department_info.get("Tech-Rescue Team", "")
         inc["incident_number"]      = base.get("incident_number", "")
         inc["department_time_zone"] = (inc.get("department", {}) or {}).get("time_zone", "")
 
@@ -959,8 +991,9 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
     df_raw = df_raw.drop(columns=[c for c in exclude_cols if c in df_raw.columns])
 
     def reorder_columns(df):
-        first_cols = ["department_neris_id", "department_name", "neris_id",
-                      "neris_uid", "incident_status_status"]
+        first_cols = ["department_neris_id", "department_name", "County",
+                      "Tech-Rescue Team", "neris_id", "neris_uid",
+                      "incident_status_status"]
         location_cols = [
             "location_source", "location_street_number", "location_street_prefix",
             "location_street_name", "location_street_type", "location_street_suffix",
@@ -986,9 +1019,11 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
     df_raw = reorder_columns(df_raw)
 
     def clean_df(df):
+        preserve_columns = {"County", "Tech-Rescue Team"} if is_massachusetts else set()
         drop = [
             col for col in df.columns
-            if df[col].dropna().pipe(
+            if col not in preserve_columns
+            and df[col].dropna().pipe(
                 lambda s: s.empty or s.apply(
                     lambda x: x == "" or x == [] or str(x) == "[]"
                 ).all()
@@ -1088,7 +1123,6 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
     write_sheet(wb, df_overview, "Overview")
     write_sheet(wb, df_raw,      "Raw Data")
 
-    import pathlib
     docs_dir = pathlib.Path.home() / "Documents"
     docs_dir.mkdir(exist_ok=True)
     filename = str(docs_dir / filename)
