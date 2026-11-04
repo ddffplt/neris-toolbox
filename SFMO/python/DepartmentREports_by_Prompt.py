@@ -3,7 +3,7 @@
 
 import re
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import openpyxl
@@ -126,16 +126,20 @@ def add_block_sheet(workbook, title, source_worksheet, block):
     worksheet.sheet_view.showGridLines = source_worksheet.sheet_view.showGridLines
 
 
-def add_table(workbook, title, headers, rows, entity_name, entity_id):
+def add_table(workbook, title, headers, rows, entity_name, entity_id, column_formats=None):
     worksheet = workbook.create_sheet(title[:31])
     worksheet.append([entity_name, entity_id])
     worksheet.append([])
     worksheet.append(headers)
     for row in rows:
         worksheet.append(row)
+    column_formats = column_formats or {}
     for row in worksheet.iter_rows(min_row=4):
         for cell in row:
-            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+            header = headers[cell.column - 1] if cell.column <= len(headers) else None
+            if header in column_formats:
+                cell.number_format = column_formats[header]
+            elif isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
                 cell.number_format = NUMBER_FORMAT
     worksheet.freeze_panes = "A4"
     for cell in worksheet[3]:
@@ -145,6 +149,76 @@ def add_table(workbook, title, headers, rows, entity_name, entity_id):
         worksheet.column_dimensions[column[0].column_letter].width = min(
             max(len(str(cell.value or "")) for cell in column) + 2, 36
         )
+
+
+SIMULTANEOUS_ID = "Department/Entity ID"
+SIMULTANEOUS_NAME = "Department Name"
+CALL_DATE = "Call Date"
+EASTERN = "Call Date (Eastern Time Zone)"
+SIMULTANEOUS_FORMATS = {
+    "Incident Number": "@",
+    EASTERN: "mm/dd/yy hh:mm",
+    EASTERN + " Date": "mm/dd/yy",
+    EASTERN + " Time": "hh:mm",
+    EASTERN + " Year": "0",
+    EASTERN + " Hour": "0",
+    "Incident Time on Scene (Minutes)": "0.00",
+    "Total Incident Time (Minutes)": "0.00",
+}
+
+
+def utc_to_eastern(value):
+    """Convert an ISO UTC timestamp to naive US Eastern time (EST/EDT), or None."""
+    if not value:
+        return None
+    try:
+        utc = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    utc = utc.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def nth_sunday(month, n):
+        first = datetime(utc.year, month, 1)
+        return first + timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+
+    dst_start = nth_sunday(3, 2).replace(hour=7)
+    dst_end = nth_sunday(11, 1).replace(hour=6)
+    return utc - timedelta(hours=4 if dst_start <= utc < dst_end else 5)
+
+
+def read_simultaneous_rows(path):
+    """Read the simultaneous-calls Overview sheet, rebuilding its formula-driven Eastern columns."""
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    rows = list(workbook["Overview"].iter_rows(values_only=True))
+    headers = list(rows[0])
+    call_index = headers.index(CALL_DATE) if CALL_DATE in headers else None
+    eastern_headers = {EASTERN + suffix: suffix for suffix in
+                       ("", " Date", " Time", " Month", " Year", " Hour")}
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    by_entity = {}
+    id_index = headers.index(SIMULTANEOUS_ID)
+    for row in rows[1:]:
+        if not row or not row[id_index]:
+            continue
+        values = list(row)
+        eastern = utc_to_eastern(values[call_index]) if call_index is not None else None
+        for index, header in enumerate(headers):
+            suffix = eastern_headers.get(header)
+            if suffix is None:
+                continue
+            if eastern is None:
+                values[index] = ""
+            else:
+                values[index] = {
+                    "": eastern,
+                    " Date": eastern.replace(hour=0, minute=0, second=0),
+                    " Time": eastern.time(),
+                    " Month": months[eastern.month - 1],
+                    " Year": eastern.year,
+                    " Hour": eastern.hour,
+                }[suffix]
+        by_entity.setdefault(str(row[id_index]), []).append(values)
+    return headers, by_entity
 
 
 def add_sources_sheet(workbook, entity_name, entity_id, source_files):
@@ -162,6 +236,11 @@ def add_sources_sheet(workbook, entity_name, entity_id, source_files):
         cell.fill = openpyxl.styles.PatternFill("solid", fgColor="1F4E78")
 
 
+def is_simultaneous_overview(worksheet):
+    header = next(worksheet.iter_rows(max_row=1, values_only=True), ())
+    return "Simultaneous Call Count" in header and SIMULTANEOUS_ID in header
+
+
 def classify_files(files):
     classified = {}
     for path in files:
@@ -177,6 +256,8 @@ def classify_files(files):
             category = "types"
         elif "Monthly Incident Counts" in sheets:
             category = "monthly"
+        elif "Overview" in sheets and is_simultaneous_overview(workbook["Overview"]):
+            category = "simultaneous"
         else:
             print(f"Skipping unrecognized workbook: {path.name}")
             continue
@@ -204,6 +285,9 @@ def build_reports(files, output_folder):
     type_headers, type_rows = read_rows(classified["types"], "Incident Type Summary") if "types" in classified else (None, [])
     type_month_headers, type_month_rows = read_rows(classified["types"], "Monthly Incident Counts") if "types" in classified else (None, [])
     month_headers, month_rows = read_rows(classified["monthly"], "Monthly Incident Counts") if "monthly" in classified else (None, [])
+    simultaneous_headers, simultaneous_rows = (
+        read_simultaneous_rows(classified["simultaneous"]) if "simultaneous" in classified else (None, {})
+    )
     rows_by_entity = {
         "types": {str(row[0]): row for row in type_rows},
         "type_month": {str(row[0]): row for row in type_month_rows},
@@ -212,7 +296,8 @@ def build_reports(files, output_folder):
     entity_ids = sorted(
         set(fire_blocks) | set(rows_by_entity["types"]) | set(rows_by_entity["monthly"])
         | set(aid_entity_blocks) | set(aid_lieu_blocks) | set(smoke_blocks)
-    )
+                | set(simultaneous_rows)
+            )
     output_folder.mkdir(parents=True, exist_ok=True)
 
     for entity_id in entity_ids:
@@ -223,6 +308,13 @@ def build_reports(files, output_folder):
             or aid_entity_blocks.get(entity_id, ("", None, None))[0]
             or aid_lieu_blocks.get(entity_id, ("", None, None))[0]
             or smoke_blocks.get(entity_id, ("", None, None))[0]
+            or next(
+                (row[simultaneous_headers.index(SIMULTANEOUS_NAME)]
+                 for row in simultaneous_rows.get(entity_id, [])
+                 if SIMULTANEOUS_NAME in simultaneous_headers
+                 and row[simultaneous_headers.index(SIMULTANEOUS_NAME)]),
+                "",
+            )
             or entity_id
         )
         workbook = openpyxl.Workbook()
@@ -243,6 +335,11 @@ def build_reports(files, output_folder):
             add_table(workbook, "Incident Types", type_headers, [rows_by_entity["types"][entity_id]], entity_name, entity_id)
         if "types" in classified and entity_id in rows_by_entity["type_month"]:
             add_table(workbook, "Type Monthly Activity", type_month_headers, [rows_by_entity["type_month"][entity_id]], entity_name, entity_id)
+        if entity_id in simultaneous_rows:
+            add_table(
+                workbook, "Simultaneous Calls", simultaneous_headers,
+                simultaneous_rows[entity_id], entity_name, entity_id, SIMULTANEOUS_FORMATS,
+            )
         add_sources_sheet(workbook, entity_name, entity_id, sorted(classified.items()))
         path = output_folder / f"{safe_name(entity_name)}_{safe_name(entity_id)}_combined.xlsx"
         workbook.save(path)
