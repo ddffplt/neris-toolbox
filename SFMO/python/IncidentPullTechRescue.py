@@ -219,7 +219,7 @@ def calculate_date_range(range_type, start_date=None, end_date=None):
 
 
 def authenticate_client_credentials():
-    from neris_auth import authenticate_client_credentials as _authenticate
+    from neris_auth import authenticate_with_fallback as _authenticate
 
     return _authenticate()
 

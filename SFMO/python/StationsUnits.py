@@ -18,8 +18,6 @@ STATE = "XX"
  
 EXPORT_PATH = "neris_apparatus_{state}_{timestamp}.csv"
 
-USERNAME = ""
-PASSWORD = ""
  
  
 OUTPUT_FILE = EXPORT_PATH.format(
@@ -45,18 +43,9 @@ CSV_FIELDS = [
     "unit_dedicated_staffing",
 ]
 
-#Authenticate and MFA 
-def authenticate(username, password):
-    from neris_api_client import NerisApiClient, Config
-    print("\nConnecting to NERIS API...")
-    client = NerisApiClient(Config(
-        base_url="https://api.neris.fsri.org/v1",
-        grant_type="password",
-        username=username,
-        password=password,
-    ))
-    print("\n✓ Authentication successful!")
-    return client
+def authenticate():
+    from neris_auth import authenticate_with_fallback
+    return authenticate_with_fallback()
  
  
 
@@ -158,14 +147,11 @@ def main():
  
     state = STATE.strip().upper()
  
-    username = USERNAME.strip() if USERNAME.strip() else input("NERIS username (email): ")
-    password = PASSWORD.strip() if PASSWORD.strip() else input("NERIS password: ")
- 
     export_dir = os.path.dirname(OUTPUT_FILE)
     if export_dir:
         os.makedirs(export_dir, exist_ok=True)
  
-    client = authenticate(username, password)
+    client = authenticate()
  
     #Get all entities for the state
     print(f"\n-- Step 1: Fetching all {state} departments --")

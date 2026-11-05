@@ -57,9 +57,6 @@ def prompt_config():
     print("=" * 60)
 
     print("\n── Credentials ──────────────────────────────────")
-    username = input("NERIS Email: ").strip()
-    print("NERIS Password (note: characters will be visible):")
-    password = input("> ").strip()
 
     print("\n── Query Parameters ─────────────────────────────")
     state_code = input("State Code (e.g. MI, VA, CA): ").strip().upper()
@@ -91,7 +88,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return username, password, state_code, range_type, start_date, end_date
+    return state_code, range_type, start_date, end_date
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
     """Return (call_create_start, call_create_end) as UTC-aware datetimes."""
@@ -127,19 +124,9 @@ def calculate_date_range(range_type, start_date=None, end_date=None):
     return None, None
 
 
-def authenticate(username, password):
-    from neris_api_client import NerisApiClient, Config
-
-    print("\nConnecting to NERIS API...")
-    client = NerisApiClient(Config(
-        base_url="https://api.neris.fsri.org/v1",
-        grant_type="password",
-        username=username,
-        password=password,
-    ))
-
-    print("\n✓ Authentication successful!")
-    return client
+def authenticate():
+    from neris_auth import authenticate_with_fallback
+    return authenticate_with_fallback()
 
 
 def get_state_incidents(client, state_code,
@@ -736,14 +723,12 @@ def export_to_excel(incidents, client, state_code):
 def main():
     ensure_dependencies()
 
-    username, password, state_code, range_type, start_date, end_date = prompt_config()
+    state_code, range_type, start_date, end_date = prompt_config()
 
-    if not username or not password:
-        sys.exit("✗ Email and password are required.")
     if not state_code:
         sys.exit("✗ State code is required.")
 
-    client = authenticate(username, password)
+    client = authenticate()
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
 

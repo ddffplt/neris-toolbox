@@ -18,7 +18,7 @@ from EntityFireActivityReport import (
     fetch_incidents,
 )
 
-from neris_auth import authenticate_client_credentials as _authenticate
+from neris_auth import authenticate_with_fallback as _authenticate
 
 CURRENT_YTD = "Occurred in current calendar year to date"
 DATE_RANGE_OPTIONS = _BASE_DATE_RANGE_OPTIONS[:-1] + [CURRENT_YTD, _BASE_DATE_RANGE_OPTIONS[-1]]

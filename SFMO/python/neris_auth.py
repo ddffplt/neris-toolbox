@@ -25,6 +25,44 @@ def _load_dotenv():
         return
 
 
+def authenticate_with_password():
+    """Interactive email/password login (the NERIS client prompts for the MFA code)."""
+    import getpass
+    from neris_api_client import Config, NerisApiClient
+
+    username = input("NERIS Email: ").strip()
+    password = getpass.getpass("NERIS Password: ").strip()
+    if not username or not password:
+        sys.exit("Email and password are required.")
+
+    print("\nConnecting to NERIS API...")
+    client = NerisApiClient(
+        Config(
+            base_url=BASE_URL,
+            grant_type="password",
+            username=username,
+            password=password,
+        )
+    )
+    print("\nCHECK YOUR EMAIL FOR THE MFA CODE")
+    client.list_incidents(page_size=1)
+    print("✓ Authentication successful!")
+    return client
+
+
+def authenticate_with_fallback(verify_ssl=True):
+    """Try the client credentials first; prompt for email/password if missing or rejected."""
+    _load_dotenv()
+    if not (os.environ.get("NERIS_CLIENT_ID") and os.environ.get("NERIS_CLIENT_SECRET")):
+        print("Client credentials not found in environment or .env; falling back to email/password login.")
+        return authenticate_with_password()
+    try:
+        return authenticate_client_credentials(verify_ssl=verify_ssl)
+    except Exception as exc:
+        print(f"Client credential login failed ({exc}); falling back to email/password login.")
+        return authenticate_with_password()
+
+
 def authenticate_client_credentials(verify_ssl=True):
     from neris_api_client import Config, NerisApiClient
 

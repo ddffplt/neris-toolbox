@@ -61,9 +61,6 @@ def prompt_config():
     print("\n" + "=" * 60)
     print("  NERIS Fire Activity Report by Entity")
     print("=" * 60)
-    username = input("NERIS Email: ").strip()
-    print("NERIS Password (note: characters will be visible):")
-    password = input("> ").strip()
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
     entity_prefix = input("Entity ID prefix filter (optional, e.g. FD25025): ").strip() or None
     entity_id = None
@@ -97,9 +94,9 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    if not username or not password or not state_code:
-        sys.exit("Email, password, and state code are required.")
-    return username, password, state_code, entity_id, entity_prefix, range_type, start_date, end_date
+    if not state_code:
+        sys.exit("State code is required.")
+    return state_code, entity_id, entity_prefix, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -141,25 +138,9 @@ def date_range_label(range_type, start_date=None, end_date=None):
     return "selected-range"
 
 
-def authenticate(username, password):
-    os.environ.update({
-        "NERIS_BASE_URL": "https://api.neris.fsri.org/v1",
-        "NERIS_GRANT_TYPE": "password",
-        "NERIS_USERNAME": username,
-        "NERIS_PASSWORD": password,
-    })
-    from neris_api_client import Config, NerisApiClient  # type: ignore[import-not-found]
-    print("\nConnecting to NERIS API...")
-    client = NerisApiClient(Config(
-        base_url="https://api.neris.fsri.org/v1",
-        grant_type="password",
-        username=username,
-        password=password,
-    ))
-    print("\nCHECK YOUR EMAIL FOR THE MFA CODE")
-    client.list_incidents(page_size=1)
-    print("Authentication successful!")
-    return client
+def authenticate():
+    from neris_auth import authenticate_with_fallback
+    return authenticate_with_fallback()
 
 
 def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_size=100):
@@ -574,9 +555,9 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
 
 def main():
     ensure_dependencies()
-    username, password, state_code, entity_id, entity_prefix, range_type, start_date, end_date = prompt_config()
+    state_code, entity_id, entity_prefix, range_type, start_date, end_date = prompt_config()
     start, end = calculate_date_range(range_type, start_date, end_date)
-    client = authenticate(username, password)
+    client = authenticate()
     entity_names = fetch_entities(client, state_code, entity_id)
     if entity_prefix:
         entity_prefix = entity_prefix.upper()

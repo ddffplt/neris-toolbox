@@ -172,9 +172,9 @@ def authenticate():
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from neris_auth import authenticate_client_credentials
+    from neris_auth import authenticate_with_fallback
 
-    return authenticate_client_credentials(verify_ssl=False)
+    return authenticate_with_fallback(verify_ssl=False)
 
 
 # ─────────────────────────────────────────────

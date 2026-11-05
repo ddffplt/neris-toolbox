@@ -63,12 +63,9 @@ DATE_RANGE_OPTIONS = [
 
 def parse_cli_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--username', '-u')
-    parser.add_argument('--password', '-p')
     parser.add_argument('--entity-id', '-e')
     parser.add_argument('--statewide', action='store_true', help='Run statewide (no entity filter), overrides --entity-id if provided')
     parser.add_argument('--national', action='store_true', help='Allow nationwide run (no state filter)')
-    parser.add_argument('--mfa-code', help='One-time MFA code to supply non-interactively')
     parser.add_argument('--range-type', choices=DATE_RANGE_OPTIONS)
     parser.add_argument('--start-date', help='YYYY-MM-DD')
     parser.add_argument('--end-date', help='YYYY-MM-DD')
@@ -86,9 +83,6 @@ def prompt_config():
     print("=" * 60)
 
     print("\n── Credentials ──────────────────────────────────")
-    username = input("NERIS Email: ").strip()
-    print("NERIS Password (note: characters will be visible):")
-    password = input("> ").strip()
 
     print("\n── Query Parameters ─────────────────────────────")
     print("Enter a NERIS Entity ID (e.g. FD26163151) to fetch incidents for a single department.")
@@ -123,7 +117,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return username, password, entity_id, range_type, start_date, end_date
+    return entity_id, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -186,40 +180,9 @@ def filter_incidents_by_date(incidents, start=None, end=None):
         filtered.append(incident)
     return filtered
 
-def authenticate(username, password, mfa_code=None):
-    os.environ["NERIS_BASE_URL"]   = "https://api.neris.fsri.org/v1"
-    os.environ["NERIS_GRANT_TYPE"] = "password"
-    os.environ["NERIS_USERNAME"]   = username
-    os.environ["NERIS_PASSWORD"]   = password
-
-    from neris_api_client import NerisApiClient
-
-    print("\nConnecting to NERIS API...")
-    client = NerisApiClient()
-
-    print("\n" + "=" * 60)
-    print("  CHECK YOUR EMAIL FOR THE MFA CODE")
-    print("=" * 60)
-
-    orig_input = None
-    if mfa_code is not None:
-        orig_input = builtins.input
-        builtins.input = lambda prompt=None: mfa_code
-    else:
-        print("\nAbout to trigger the MFA challenge. When you are ready to receive the code, press Enter to continue.")
-        try:
-            builtins.input("")
-        except Exception:
-            input("")
-
-    try:
-        client.list_incidents(page_size=1)
-    finally:
-        if orig_input is not None:
-            builtins.input = orig_input
-
-    print("\n✓ Authentication successful!")
-    return client
+def authenticate():
+    from neris_auth import authenticate_with_fallback
+    return authenticate_with_fallback()
 
 
 def get_department_incidents(client, neris_id_entity,
@@ -824,13 +787,11 @@ def main():
 
     args = parse_cli_args()
     cli_used = any([
-        args.username, args.password, args.range_type, args.start_date,
+        args.range_type, args.start_date,
         args.end_date, args.entity_id, args.statewide, args.max_incidents, args.page_size
     ])
 
     if cli_used:
-        username = args.username or os.environ.get("NERIS_USERNAME")
-        password = args.password or os.environ.get("NERIS_PASSWORD")
         entity_id = None if args.statewide else (args.entity_id or None)
         range_type = args.range_type or "All Records"
         start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
@@ -838,17 +799,14 @@ def main():
         max_incidents = args.max_incidents
         page_size = args.page_size or 100
     else:
-        username, password, entity_id, range_type, start_date, end_date = prompt_config()
+        entity_id, range_type, start_date, end_date = prompt_config()
         max_incidents = None
         page_size = 100
 
-    if not username or not password:
-        sys.exit("✗ Email and password are required.")
     if not entity_id:
         print("No NERIS Entity ID provided — running statewide (no entity filter).")
 
-    mfa_code = args.mfa_code if 'args' in locals() else None
-    client = authenticate(username, password, mfa_code=mfa_code)
+    client = authenticate()
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
     all_entity_ids = [entity_id] if entity_id else []

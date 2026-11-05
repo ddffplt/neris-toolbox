@@ -73,9 +73,6 @@ def prompt_config():
     print("      Blank = no data of either kind submitted.\n")
 
     print("-- Credentials --")
-    username = input("NERIS Email: ").strip()
-    print("NERIS Password (note: characters will be visible):")
-    password = input("> ").strip()
 
     print("\n-- Query Parameters --")
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
@@ -111,10 +108,10 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    if not username or not password or not state_code:
-        sys.exit("✗ Email, password, and state code are required.")
+    if not state_code:
+        sys.exit("✗ State code is required.")
 
-    return username, password, state_code, entity_id, range_type, start_date, end_date
+    return state_code, entity_id, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -153,25 +150,9 @@ def calculate_date_range(range_type, start_date=None, end_date=None):
 # 3. AUTHENTICATION
 # ─────────────────────────────────────────────
 
-def authenticate(username, password):
-    os.environ["NERIS_BASE_URL"]   = "https://api.neris.fsri.org/v1"
-    os.environ["NERIS_GRANT_TYPE"] = "password"
-    os.environ["NERIS_USERNAME"]   = username
-    os.environ["NERIS_PASSWORD"]   = password
-
-    from neris_api_client import NerisApiClient
-
-    print("\nConnecting to NERIS API...")
-    client = NerisApiClient()
-
-    print("\n" + "=" * 60)
-    print("  CHECK YOUR EMAIL FOR THE MFA CODE")
-    print("=" * 60)
-
-    client.list_incidents(page_size=1)
-
-    print("\n✓ Authentication successful!")
-    return client
+def authenticate():
+    from neris_auth import authenticate_with_fallback
+    return authenticate_with_fallback()
 
 
 # ─────────────────────────────────────────────
@@ -540,14 +521,14 @@ def main():
     import pandas as pd
 
     (
-        username, password, state_code, entity_id,
+        state_code, entity_id,
         range_type, start_date, end_date,
     ) = prompt_config()
     call_create_start, call_create_end = calculate_date_range(
         range_type, start_date, end_date
     )
 
-    client = authenticate(username, password)
+    client = authenticate()
 
     # Master department list
     all_entities = fetch_all_entities(client, state_code, entity_id)

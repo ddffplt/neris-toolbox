@@ -177,9 +177,7 @@ def main():
     range_label = f"{args.start or 'all'}_to_{args.end or 'present'}"
 
     fire_report.ensure_dependencies()
-    username = input("NERIS Email: ").strip()
-    password = input("NERIS Password: ").strip()
-    client = fire_report.authenticate(username, password)
+    client = fire_report.authenticate()
     entities = fire_report.fetch_entities(client, args.state, args.entity)
     if args.limit is not None:
         if args.limit < 1:
