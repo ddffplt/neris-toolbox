@@ -126,23 +126,34 @@ def add_block_sheet(workbook, title, source_worksheet, block):
     worksheet.sheet_view.showGridLines = source_worksheet.sheet_view.showGridLines
 
 
-def add_table(workbook, title, headers, rows, entity_name, entity_id, column_formats=None):
+def add_table(workbook, title, headers, rows, entity_name, entity_id, column_formats=None, summary=None):
     worksheet = workbook.create_sheet(title[:31])
     worksheet.append([entity_name, entity_id])
     worksheet.append([])
+    for label, value in summary or []:
+        worksheet.append([label, value])
+    if summary:
+        worksheet.append([])
+    header_row = worksheet.max_row + 1
     worksheet.append(headers)
     for row in rows:
         worksheet.append(row)
     column_formats = column_formats or {}
-    for row in worksheet.iter_rows(min_row=4):
+    for row in worksheet.iter_rows(min_row=3, max_row=header_row - 1):
+        row[0].font = openpyxl.styles.Font(bold=True)
+        for cell in row[1:2]:
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = "0.00" if isinstance(cell.value, float) else NUMBER_FORMAT
+                cell.alignment = openpyxl.styles.Alignment(horizontal="left")
+    for row in worksheet.iter_rows(min_row=header_row + 1):
         for cell in row:
             header = headers[cell.column - 1] if cell.column <= len(headers) else None
             if header in column_formats:
                 cell.number_format = column_formats[header]
             elif isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
                 cell.number_format = NUMBER_FORMAT
-    worksheet.freeze_panes = "A4"
-    for cell in worksheet[3]:
+    worksheet.freeze_panes = f"A{header_row + 1}"
+    for cell in worksheet[header_row]:
         cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
         cell.fill = openpyxl.styles.PatternFill("solid", fgColor="1F4E78")
     for column in worksheet.columns:
@@ -336,9 +347,20 @@ def build_reports(files, output_folder):
         if "types" in classified and entity_id in rows_by_entity["type_month"]:
             add_table(workbook, "Type Monthly Activity", type_month_headers, [rows_by_entity["type_month"][entity_id]], entity_name, entity_id)
         if entity_id in simultaneous_rows:
+            count_index = simultaneous_headers.index("Simultaneous Call Count")
+            counts = [
+                row[count_index] for row in simultaneous_rows[entity_id]
+                if isinstance(row[count_index], (int, float))
+            ]
+            summary = [
+                ("Summary", None),
+                ("Total simultaneous incidents", len(simultaneous_rows[entity_id])),
+                ("Highest simultaneous call count", max(counts) if counts else ""),
+                ("Average simultaneous call count", round(sum(counts) / len(counts), 2) if counts else ""),
+            ]
             add_table(
                 workbook, "Simultaneous Calls", simultaneous_headers,
-                simultaneous_rows[entity_id], entity_name, entity_id, SIMULTANEOUS_FORMATS,
+                simultaneous_rows[entity_id], entity_name, entity_id, SIMULTANEOUS_FORMATS, summary,
             )
         add_sources_sheet(workbook, entity_name, entity_id, sorted(classified.items()))
         path = output_folder / f"{safe_name(entity_name)}_{safe_name(entity_id)}_combined.xlsx"
