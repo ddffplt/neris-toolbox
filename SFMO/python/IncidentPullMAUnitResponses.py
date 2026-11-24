@@ -70,33 +70,11 @@ def prompt_config():
     print("\n── Query Parameters ─────────────────────────────")
     state_code = input("State Code (e.g. MI, VA, CA): ").strip().upper()
 
-    print("\nEntity Scope Options:")
-    print("  1. One entity")
-    print("  2. Entities in an FD25 county prefix")
-    print("  3. Entire state")
-    while True:
-        scope_choice = input("Select entity scope [1]: ").strip() or "1"
-        if scope_choice in {"1", "2", "3"}:
-            break
-        print("  Invalid selection, choose 1, 2, or 3.")
-
-    entity_id = None
-    entity_prefix = None
-    if scope_choice == "1":
-        entity_id = input("NERIS Entity ID (e.g. FD26163151): ").strip()
-        if not entity_id:
-            print("  An entity ID is required for this scope.")
-            return prompt_config()
-    elif scope_choice == "2":
-        while True:
-            entity_prefix = normalize_fd25_prefix(
-                input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")
-            )
-            if entity_prefix:
-                break
-            print("  Invalid prefix. Use FD25 followed by an odd county code from 001 through 027, such as FD25001*.")
-
-    entity_scope = {"1": "entity", "2": "fd25_prefix", "3": "statewide"}[scope_choice]
+    from prompt_snippets import prompt_entity_scope
+    try:
+        entity_scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for i, opt in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -126,7 +104,7 @@ def prompt_config():
                 print("  Invalid format, use YYYY-MM-DD.")
 
     return (
-        state_code, entity_id, entity_prefix, entity_scope,
+        state_code, entity_id, entity_prefix, entity_names, entity_scope,
         range_type, start_date, end_date,
     )
 
@@ -282,8 +260,8 @@ def get_entity_incidents(client, entity_id,
 
 def get_scoped_incidents(client, state_code, entity_id=None, entity_prefix=None,
                          call_create_start=None, call_create_end=None,
-                         page_size=100):
-    if entity_id:
+                         page_size=100, entity_scope="statewide", entity_names=None):
+    if entity_scope == "entity" and entity_id and entity_id.upper().startswith("FD"):
         return get_entity_incidents(
             client, entity_id,
             call_create_start=call_create_start,
@@ -318,11 +296,12 @@ def get_scoped_incidents(client, state_code, entity_id=None, entity_prefix=None,
             break
         page_number += 1
 
-    if entity_prefix:
-        entities = [
-            entity for entity in entities
-            if str(entity.get("neris_id", "")).startswith(entity_prefix)
-        ]
+    from prompt_snippets import select_entities
+    selected = select_entities(
+        {entity["neris_id"]: entity.get("name", "") for entity in entities if entity.get("neris_id")},
+        entity_scope, entity_id, entity_prefix, entity_names,
+    )
+    entities = [{"neris_id": eid, "name": name} for eid, name in selected.items()]
     print(f"\nFound {len(entities)} entities to query")
 
     all_incidents = []
@@ -346,7 +325,7 @@ def get_scoped_incidents(client, state_code, entity_id=None, entity_prefix=None,
 
 
 def export_to_excel(incidents, client, state_code, entity_scope="statewide",
-                    entity_id=None, entity_prefix=None):
+                    entity_id=None, entity_prefix=None, entity_names=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
     import pandas as pd
     from openpyxl import Workbook
@@ -1009,8 +988,10 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
             "entity": "Individual entity",
             "fd25_prefix": "FD25 county prefix",
             "statewide": "Entire state",
+            "multiple_entities": "Multiple entities",
         }.get(entity_scope, entity_scope)),
         ("Entity ID", entity_id or ""),
+        ("Selected entities", " || ".join(entity_names or [])),
     ]
     if entity_scope == "entity":
         source_details.append(("Department Name", dept_names.get(entity_id, "")))
@@ -1044,7 +1025,7 @@ def main():
     ensure_dependencies()
 
     (
-        state_code, entity_id, entity_prefix, entity_scope,
+        state_code, entity_id, entity_prefix, entity_names, entity_scope,
         range_type, start_date, end_date,
     ) = prompt_config()
 
@@ -1055,14 +1036,14 @@ def main():
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
 
-    incidents = get_scoped_incidents(
-        client,
-        state_code,
-        entity_id=entity_id,
-        entity_prefix=entity_prefix,
-        call_create_start=start_filter,
-        call_create_end=end_filter,
-    )
+    try:
+        incidents = get_scoped_incidents(
+            client, state_code, entity_id=entity_id, entity_prefix=entity_prefix,
+            entity_names=entity_names, entity_scope=entity_scope,
+            call_create_start=start_filter, call_create_end=end_filter,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     if not incidents:
         print("⚠ No incidents found for the given parameters.")
@@ -1076,6 +1057,7 @@ def main():
         entity_scope=entity_scope,
         entity_id=entity_id,
         entity_prefix=entity_prefix,
+        entity_names=entity_names,
     )
 
     print("\n" + "=" * 60)

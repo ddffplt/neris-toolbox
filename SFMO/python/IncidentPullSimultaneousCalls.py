@@ -7,7 +7,11 @@ least one other incident for the same department. An incident's window runs
 from first dispatch to last unit clear (the same two times used for Total
 Incident Time).
 
+The Massachusetts departments listed in EXCLUDED_DEPARTMENTS are excluded in
+every scope, including an explicit individual department selection.
+
 Note that if a column has no data throughout the entire dataset, it will be dropped from the Excel file output. 
+The Excel sheets are streamed to reduce memory use for large exports.
 """
 
 import sys
@@ -15,6 +19,7 @@ import subprocess
 import os
 import copy
 import json
+import math
 import re
 import time
 import traceback
@@ -58,6 +63,72 @@ DATE_RANGE_OPTIONS = [
 
 FD25_COUNTY_CODES = {f"{number:03d}" for number in range(1, 28, 2)}
 
+RAW_DATA_EXCLUDED_FIELDS = {
+    "parcel_primary_year_built", "parcel_primary_zoning", "parcel_primary_use",
+    "parcel_primary_owner_occupied", "parcel_primary_assessment_land", "parcel_computed_loss",
+    "exposure_count", "exposure_damage_types", "med_report_ids", "med_evaluations",
+    "med_patient_statuses", "med_transport_dispositions", "base_people_present",
+    "base_displacement_count", "base_person_experiencing_homelessness",
+    "base_displacement_causes", "weather_dew_point", "weather_feels_like",
+    "weather_pressure", "weather_humidity", "weather_temp_min", "weather_temp_max",
+    "weather_heat_index", "weather_windchill", "weather_visibility", "weather_wind_speed",
+    "weather_wind_deg", "weather_cloud_percent", "weather_rain_accum_1h",
+    "weather_snow_vol_1h", "weather_day_part", "weather_air_quality_co",
+    "weather_air_quality_o3", "weather_air_quality_no2", "weather_air_quality_so2",
+    "weather_air_quality_pm2_5", "weather_air_quality_pm10",
+    "weather_air_quality_us_epa_index", "weather_air_quality_gb_defra_index",
+    "weather_pollen_hazel", "weather_pollen_alder", "weather_pollen_birch",
+    "weather_pollen_oak", "weather_pollen_grass", "weather_pollen_mugwort",
+    "weather_pollen_ragweed", "hazsit_detail_evacuated", "hazsit_detail_disposition",
+    "hazsit_detail_chemical_names", "hazsit_detail_chemical_dot_classes",
+    "actions_tactics_action_noaction_type", "actions_tactics_action_noaction_actions",
+    "base_location_use_in_use_in_use", "base_location_use_in_use_intended",
+    "csst_hazard_ignition_source", "medical_oxygen_hazard_neris_uid",
+    "medical_oxygen_hazard_last_modified", "medical_oxygen_hazard_presence_neris_uid",
+    "medical_oxygen_hazard_presence_last_modified", "medical_oxygen_hazard_presence_type",
+    "actions_tactics_action_noaction_noaction_type", "smoke_alarm_presence_type",
+    "smoke_alarm_presence_neris_uid", "smoke_alarm_presence_last_modified",
+    "fire_alarm_presence_type", "other_alarm_presence_type",
+    "other_alarm_presence_alarm_types", "fire_suppression_presence_type",
+    "fire_suppression_presence_suppression_types", "cooking_fire_suppression_presence_type",
+    "cooking_fire_suppression_presence_suppression_types", "fire_detail_location_detail_type",
+    "fire_detail_location_detail_violated_local_ordinance", "fire_detail_location_detail_cause",
+    "fire_detail_water_supply", "fire_detail_investigation_needed",
+    "fire_detail_investigation_types", "fire_detail_suppression_appliances",
+    "smoke_alarm_presence_working", "smoke_alarm_presence_operation_alerted_failed_other_type",
+    "fire_suppression_presence_operation_type_effectiveness_type",
+    "fire_suppression_presence_operation_type_effectiveness_failure_reason",
+    "fire_alarm_presence_operation_type", "fire_detail_location_detail_progression_evident",
+    "fire_detail_location_detail_floor_of_origin", "fire_detail_location_detail_arrival_condition",
+    "fire_detail_location_detail_damage_type", "fire_detail_location_detail_room_of_origin_type",
+    "powergen_hazard_count", "last_modified", "fire_detail_location_detail_acres_burned",
+    "base_location_use_use_type", "base_location_use_vacancy_cause",
+    "base_location_use_location_modifiers", "smoke_alarm_presence_alarm_types",
+    "fire_alarm_presence_alarm_types",
+    "smoke_alarm_presence_operation_alerted_failed_other_failure_reason",
+}
+
+EXCLUDED_DEPARTMENTS = {
+    "FD25025316": "Boston",
+    "FD25023717": "Brockton",
+    "FD25017735": "Cambridge",
+    "FD25013437": "Chicopee",
+    "FD25005831": "Fall River",
+    "FD25017927": "Framingham",
+    "FD25009978": "Lawrence",
+    "FD25017760": "Lowell",
+    "FD25009048": "Lynn",
+    "FD25005076": "New Bedford",
+    "FD25017442": "Newton",
+    "FD25021451": "Quincy",
+    "FD25017814": "Somerville",
+    "FD25013737": "Springfield",
+    "FD25027312": "Worcester",
+    "FD25009530": "Haverhill",
+    "FD25017651": "Malden",
+    "FD25017664": "Waltham",
+}
+
 
 def normalize_fd25_prefix(value):
     prefix = (value or "").strip().upper().rstrip("*")
@@ -91,6 +162,8 @@ def prompt_config():
     entity_prefix = None
     entity_names = []
     if scope_choice == "2":
+        if state_code != "MA":
+            sys.exit("FD25 county prefixes are only available for Massachusetts (MA).")
         while True:
             entity_prefix = normalize_fd25_prefix(
                 input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")
@@ -399,6 +472,9 @@ def get_scoped_incidents(client, state_code, entity_id=None, entity_prefix=None,
                          call_create_start=None, call_create_end=None,
                          page_size=100):
     if entity_scope == "entity" and entity_id and entity_id.upper().startswith("FD"):
+        if entity_id.upper() in EXCLUDED_DEPARTMENTS:
+            print(f"  Excluded {EXCLUDED_DEPARTMENTS[entity_id.upper()]} ({entity_id}) from simultaneous calls.")
+            return []
         return get_entity_incidents(
             client, entity_id,
             call_create_start=call_create_start,
@@ -488,6 +564,15 @@ def get_scoped_incidents(client, state_code, entity_id=None, entity_prefix=None,
             {"neris_id": entity_id_value, "name": entity_name}
             for entity_id_value, entity_name in entities
         ]
+    included_entities = []
+    for entity in entities:
+        current_id = str(entity.get("neris_id") or "").upper()
+        if current_id in EXCLUDED_DEPARTMENTS:
+            print(f"  Excluded {entity.get('name') or EXCLUDED_DEPARTMENTS[current_id]} ({current_id}) "
+                  "from simultaneous calls.")
+        else:
+            included_entities.append(entity)
+    entities = included_entities
     print(f"\nFound {len(entities)} entities to query")
 
     all_incidents = []
@@ -598,18 +683,49 @@ def find_simultaneous(incidents):
     return simultaneous, info
 
 
+def drop_raw_data_columns(df):
+    return df.drop(
+        columns=[column for column in RAW_DATA_EXCLUDED_FIELDS if column in df.columns]
+    )
+
+
+def flatten_raw_record(data):
+    """Match the ordering and collision behavior of pandas.json_normalize."""
+    flattened = {key: value for key, value in data.items() if not isinstance(value, dict)}
+
+    def visit(value, prefix):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, f"{prefix}_{key}" if prefix else str(key))
+        else:
+            flattened[prefix] = value
+
+    for key, value in data.items():
+        if isinstance(value, dict):
+            visit(value, str(key))
+    return flattened
+
+
+def has_export_value(value):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return False
+    return value != "" and value != [] and str(value) != "[]"
+
+
 def export_to_excel(incidents, client, state_code, entity_scope="statewide",
                     entity_id=None, entity_prefix=None, entity_names=None,
                     simultaneous_info=None):
     from report_metadata import add_report_sources_sheet, incident_date_range
-    import pandas as pd
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
     if not incidents:
         print("⚠ No incidents to export.")
         return None
+    if len(incidents) > 1_048_575:
+        raise ValueError("Excel worksheets can contain at most 1,048,575 incidents plus a header row.")
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     time_str = datetime.now().strftime("%H-%M-%S")
@@ -729,6 +845,10 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
     ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
     def sanitize(val):
+        if isinstance(val, (list, tuple, dict)):
+            if not val:
+                return ""
+            val = json.dumps(val, ensure_ascii=False, default=str)
         return ILLEGAL_CHARS_RE.sub("", val) if isinstance(val, str) else val
 
     # ── Overview sheet ────────────────────────────────────────────────────────
@@ -774,9 +894,8 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
 
     # ── Raw Data ──────────────────────────────────────────────────────────────
 
-    processed = []
-
-    for inc in copy.deepcopy(incidents):
+    def process_incident(original):
+        inc = copy.deepcopy(original)
         base     = inc.get("base", {}) or {}
         dispatch = inc.get("dispatch", {}) or {}
         dept_id  = base.get("department_neris_id", "")
@@ -928,9 +1047,7 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
         an = at.get("action_noaction", {}) or {}
         an["actions"] = join_list(an.get("actions", []))
 
-        processed.append(inc)
-
-    df_raw = pd.json_normalize(processed, sep="_")
+        return flatten_raw_record(inc)
 
   # If you want to add any of these fields back, you can grab them from this list and add them to the lists above. 
     exclude_cols = {
@@ -976,9 +1093,7 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
         "dispatch_tactic_timestamps_suppression_complete",
         "dispatch_tactic_timestamps_fire_under_control",
     }
-    df_raw = df_raw.drop(columns=[c for c in exclude_cols if c in df_raw.columns])
-
-    def reorder_columns(df):
+    def reorder_columns(columns):
         first_cols = ["department_neris_id", "department_name", "neris_id",
                       "neris_uid", "incident_status_status"]
         location_cols = [
@@ -992,39 +1107,40 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
         hazard_cols = ["electric_hazard_types", "electric_hazard_source_target",
                        "powergen_hazard_count"]
 
-        existing_first    = [c for c in first_cols    if c in df.columns]
-        existing_location = [c for c in location_cols if c in df.columns]
-        existing_hazard   = [c for c in hazard_cols   if c in df.columns]
+        existing_first    = [c for c in first_cols    if c in columns]
+        existing_location = [c for c in location_cols if c in columns]
+        existing_hazard   = [c for c in hazard_cols   if c in columns]
         pinned            = set(existing_first + existing_location + existing_hazard + ["last_modified"])
-        middle_cols       = [c for c in df.columns if c not in pinned]
+        middle_cols       = [c for c in columns if c not in pinned]
 
         final_order = existing_first + existing_location + middle_cols + existing_hazard
-        if "last_modified" in df.columns:
+        if "last_modified" in columns:
             final_order.append("last_modified")
-        return df[final_order]
+        return final_order
 
-    df_raw = reorder_columns(df_raw)
+    def populated_columns(rows, excluded=frozenset()):
+        columns = {}
+        populated = set()
+        for row in rows:
+            for key, value in row.items():
+                if key not in excluded:
+                    columns.setdefault(key, None)
+                    if has_export_value(value):
+                        populated.add(key)
+        return [key for key in columns if key in populated]
 
-    def clean_df(df):
-        drop = [
-            col for col in df.columns
-            if df[col].dropna().pipe(
-                lambda s: s.empty or s.apply(
-                    lambda x: x == "" or x == [] or str(x) == "[]"
-                ).all()
-            )
-        ]
-        return df.drop(columns=drop)
+    overview_headers = populated_columns(overview_rows)
+    raw_headers = reorder_columns(populated_columns(
+        (process_incident(inc) for inc in incidents),
+        exclude_cols | RAW_DATA_EXCLUDED_FIELDS,
+    ))
 
-    df_overview   = clean_df(pd.DataFrame(overview_rows).fillna(""))
-    df_raw        = clean_df(df_raw)
+    print(f"  Overview:          {len(overview_headers)} columns")
+    print(f"  Raw Data:          {len(raw_headers)} columns")
 
-    print(f"  Overview:          {len(df_overview.columns)} columns")
-    print(f"  Raw Data:          {len(df_raw.columns)} columns")
-
-    def write_sheet(wb, df, name):
+    def write_sheet(wb, rows, columns, name, sample):
         ws      = wb.create_sheet(name)
-        headers = list(df.columns)
+        headers = list(columns)
         eastern_col_idx = None
         utc_col_idx = None
         if "Call Date" in headers:
@@ -1038,15 +1154,32 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
                 "Call Date (Eastern Time Zone) Year",
                 "Call Date (Eastern Time Zone) Hour",
             ]
-        ws.append(headers)
-        for _, row in df.iterrows():
-            values = [sanitize(row[h]) if h in row else "" for h in headers]
-            ws.append(values)
+        fill  = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        font  = Font(color="FFFFFF", bold=True, size=11)
+        align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for col_idx, header in enumerate(headers, 1):
+            max_len = len(str(header))
+            if eastern_col_idx is not None and col_idx in (eastern_col_idx, eastern_col_idx + 3) and sample:
+                max_len = 58
+            for row in sample:
+                val = row.get(header)
+                if val:
+                    max_len = max(max_len, len(str(sanitize(val))))
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 12), 60)
+        ws.freeze_panes = "A2"
+        header_cells = []
+        for header in headers:
+            cell = WriteOnlyCell(ws, value=header)
+            cell.fill, cell.font, cell.alignment = fill, font, align
+            header_cells.append(cell)
+        ws.append(header_cells)
+        for row_num, row in enumerate(rows, 2):
+            values = [sanitize(row.get(h, "")) for h in headers]
+            values = [None if isinstance(v, float) and math.isnan(v) else v for v in values]
             if eastern_col_idx is not None:
-                row_num = ws.max_row
                 utc_cell = f"{get_column_letter(utc_col_idx)}{row_num}"
                 eastern_cell = f"{get_column_letter(eastern_col_idx)}{row_num}"
-                ws.cell(row_num, eastern_col_idx).value = (
+                values[eastern_col_idx - 1] = (
                     f'=IF({utc_cell}="","",'
                     f'DATE(VALUE(LEFT({utc_cell},4)),VALUE(MID({utc_cell},6,2)),'
                     f'VALUE(MID({utc_cell},9,2)))+'
@@ -1063,56 +1196,183 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
                     f'MOD(8-WEEKDAY(DATE(VALUE(LEFT({utc_cell},4)),11,1)),7)+TIME(6,0,0)), '
                     f'TIME(4,0,0),TIME(5,0,0)))'
                 )
-                ws.cell(row_num, eastern_col_idx + 1).value = (
+                values[eastern_col_idx] = (
                     f'=IF({eastern_cell}="","",INT({eastern_cell}))'
                 )
-                ws.cell(row_num, eastern_col_idx + 2).value = (
+                values[eastern_col_idx + 1] = (
                     f'=IF({eastern_cell}="","",MOD({eastern_cell},1))'
                 )
-                ws.cell(row_num, eastern_col_idx + 3).value = (
+                values[eastern_col_idx + 2] = (
                     f'=IF({eastern_cell}="","",CHOOSE(MONTH({eastern_cell}),'
                     f'"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"))'
                 )
-                ws.cell(row_num, eastern_col_idx + 4).value = (
+                values[eastern_col_idx + 3] = (
                     f'=IF({eastern_cell}="","",YEAR({eastern_cell}))'
                 )
-                ws.cell(row_num, eastern_col_idx + 5).value = (
+                values[eastern_col_idx + 4] = (
                     f'=IF({eastern_cell}="","",HOUR({eastern_cell}))'
                 )
-                ws.cell(row_num, eastern_col_idx).number_format = "mm/dd/yy hh:mm"
-                ws.cell(row_num, eastern_col_idx + 1).number_format = "mm/dd/yy"
-                ws.cell(row_num, eastern_col_idx + 2).number_format = "hh:mm"
+                for index, number_format in (
+                    (eastern_col_idx - 1, "mm/dd/yy hh:mm"),
+                    (eastern_col_idx, "mm/dd/yy"),
+                    (eastern_col_idx + 1, "hh:mm"),
+                ):
+                    cell = WriteOnlyCell(ws, value=values[index])
+                    cell.number_format = number_format
+                    values[index] = cell
+            ws.append(values)
 
+    def copy_sheet(source, target):
+        ws = target.create_sheet(source.title)
+        ws.freeze_panes = source.freeze_panes
+        for key, dimension in source.column_dimensions.items():
+            ws.column_dimensions[key].width = dimension.width
+        for key, dimension in source.row_dimensions.items():
+            if dimension.height is not None:
+                ws.row_dimensions[key].height = dimension.height
+        for merged_range in source.merged_cells.ranges:
+            ws.merged_cells.add(str(merged_range))
+        for row in source.iter_rows():
+            cells = []
+            for original in row:
+                cell = WriteOnlyCell(ws, value=original.value)
+                if original.has_style:
+                    cell.font = copy.copy(original.font)
+                    cell.fill = copy.copy(original.fill)
+                    cell.border = copy.copy(original.border)
+                    cell.alignment = copy.copy(original.alignment)
+                    cell.number_format = original.number_format
+                cells.append(cell)
+            ws.append(cells)
 
-        fill  = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-        font  = Font(color="FFFFFF", bold=True, size=11)
-        align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        for cell in ws[1]:
-            cell.fill, cell.font, cell.alignment = fill, font, align
-
-        for col_idx, header in enumerate(headers, 1):
-            col_letter = get_column_letter(col_idx)
-            max_len    = len(str(header))
-            for row_num in range(2, min(ws.max_row + 1, 52)):
-                val = ws.cell(row_num, col_idx).value
-                if val:
-                    max_len = max(max_len, len(str(val)))
-            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 60)
-        ws.freeze_panes = "A2"
-
-    wb = Workbook()
+    wb = Workbook(write_only=True)
+    auxiliary_wb = Workbook()
     wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
-    wb.remove(wb.active)
-    write_sheet(wb, df_overview, "Overview")
-    write_sheet(wb, df_raw,      "Raw Data")
+    write_sheet(wb, iter(overview_rows), overview_headers, "Overview", overview_rows[:50])
+    entity_ids = sorted({
+        str(value) for value in (row.get("Department/Entity ID") for row in overview_rows)
+        if value not in (None, "")
+    }) if "Department/Entity ID" in overview_headers else []
+    has_entity_summary = len(entity_ids) > 1
+    if has_entity_summary:
+        from openpyxl.styles import Border, Side
+
+        summary_ws = auxiliary_wb.create_sheet("Entity Summary")
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        header_font = Font(color="FFFFFF", bold=True, size=11)
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        heading_fill = PatternFill(start_color="D9EAF7", end_color="D9EAF7", fill_type="solid")
+        heading_border = Border(*(Side(style="thin", color="000000") for _ in range(4)))
+        cell_border = Border(*(Side(style="thin", color="B7C9D6") for _ in range(4)))
+        detail_headers = [
+            "Month", "Year", "Simultaneous Incidents", "Total Units",
+            "Average Simultaneous Call Count",
+            "Average Incident Time on Scene (Minutes)",
+            "Average Total Incident Time (Minutes)",
+        ]
+
+        def append_summary_row(month, year, records):
+            def average(column):
+                values = [
+                    record.get(column) for record in records
+                    if isinstance(record.get(column), (int, float))
+                ]
+                return round(sum(values) / len(values), 2) if values else ""
+
+            summary_ws.append([
+                month,
+                year,
+                len(records),
+                sum(record["Total Units"] for record in records
+                    if isinstance(record["Total Units"], (int, float))),
+                average("Simultaneous Call Count"),
+                average("Incident Time on Scene (Minutes)"),
+                average("Total Incident Time (Minutes)"),
+            ])
+            for cell in summary_ws[summary_ws.max_row]:
+                cell.border = cell_border
+            for cell in summary_ws[summary_ws.max_row][2:4]:
+                cell.number_format = '#,##0;(#,##0);-'
+            for cell in summary_ws[summary_ws.max_row][4:]:
+                cell.number_format = '#,##0.00;(#,##0.00);-'
+
+        for entity_index, current_entity_id in enumerate(entity_ids):
+            if entity_index:
+                summary_ws.append([])
+                summary_ws.append([])
+            entity_name = dept_names.get(current_entity_id, "")
+            summary_ws.append([current_entity_id, entity_name])
+            heading_row = summary_ws.max_row
+            summary_ws.merge_cells(
+                start_row=heading_row, start_column=2, end_row=heading_row,
+                end_column=len(detail_headers),
+            )
+            summary_ws.row_dimensions[heading_row].height = 30
+            for cell in summary_ws[heading_row][:len(detail_headers)]:
+                cell.fill = heading_fill
+                cell.border = heading_border
+                cell.font = Font(bold=True, size=12)
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+            summary_ws.append(detail_headers)
+            for cell in summary_ws[summary_ws.max_row]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = header_alignment
+                cell.border = cell_border
+            summary_ws.row_dimensions[summary_ws.max_row].height = 42
+
+            entity_rows = [
+                row for row in overview_rows
+                if str(row.get("Department/Entity ID", "")) == current_entity_id
+            ]
+            grouped = {}
+            for record in entity_rows:
+                call_date = parse_api_datetime(record.get("Call Date"))
+                if call_date is not None:
+                    if call_date.tzinfo is None:
+                        call_date = call_date.replace(tzinfo=timezone.utc)
+                    eastern_date = datetime.strptime(
+                        to_eastern_text(call_date), "%Y-%m-%d %H:%M:%S"
+                    )
+                    month_year = (eastern_date.year, eastern_date.month)
+                else:
+                    month_year = (None, None)
+                grouped.setdefault(month_year, []).append(record)
+            for (year, month), records in sorted(
+                grouped.items(),
+                key=lambda item: (
+                    item[0][0] is None,
+                    item[0][0] or 0,
+                    item[0][1] or 0,
+                ),
+            ):
+                append_summary_row(
+                    datetime(year, month, 1).strftime("%B") if month else "Unknown",
+                    year or "",
+                    records,
+                )
+
+        for column_index in range(1, len(detail_headers) + 1):
+            longest = max(
+                len(str(summary_ws.cell(row=row, column=column_index).value or ""))
+                for row in range(1, summary_ws.max_row + 1)
+            )
+            summary_ws.column_dimensions[get_column_letter(column_index)].width = min(
+                max(longest + 2, 14), 40
+            )
+        summary_ws.freeze_panes = "A1"
+        copy_sheet(summary_ws, wb)
+    raw_sample = [process_incident(inc) for inc in incidents[:50]]
+    write_sheet(wb, (process_incident(inc) for inc in incidents), raw_headers, "Raw Data", raw_sample)
 
     import pathlib
     docs_dir = pathlib.Path.home() / "Documents"
     docs_dir.mkdir(exist_ok=True)
     filename = str(docs_dir / filename)
-    sheets = "Overview, Raw Data"
+    sheets = "Overview, Entity Summary, Raw Data" if has_entity_summary else "Overview, Raw Data"
     source_details = [
         ("State", state_code),
         ("Entity scope", {
@@ -1155,15 +1415,19 @@ def export_to_excel(incidents, client, state_code, entity_scope="statewide",
     source_details.extend([
         ("County prefix", entity_prefix or ""),
         ("Incident types", "All (simultaneous calls only)"),
+        ("Excluded departments", " || ".join(
+            f"{name} ({entity_id})" for entity_id, name in EXCLUDED_DEPARTMENTS.items()
+        )),
         ("Included sheets", sheets),
     ])
 
     add_report_sources_sheet(
-        wb,
+        auxiliary_wb,
         "IncidentPullSimultaneousCalls.py",
         incident_date_range(incidents),
         source_details,
     )
+    copy_sheet(auxiliary_wb["Report Sources"], wb)
     wb.save(filename)
 
     print(f"\n✓ Exported: {filename}")

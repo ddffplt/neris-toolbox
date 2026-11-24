@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from prompt_snippets import prompt_entity_scope, select_entities
 
 
 # ─────────────────────────────────────────────
@@ -94,7 +95,10 @@ def prompt_config():
 
     print("\n-- Query Parameters --")
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
-    entity_id  = input("NERIS Entity ID (optional — leave blank for all departments): ").strip() or None
+    try:
+        scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for i, option in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -129,7 +133,7 @@ def prompt_config():
     if not state_code:
         sys.exit("✗ State code is required.")
 
-    return state_code, entity_id, range_type, start_date, end_date
+    return state_code, scope, entity_id, entity_prefix, entity_names, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -586,7 +590,8 @@ def main():
     import pandas as pd
 
     (
-        state_code, entity_id, range_type, start_date, end_date,
+        state_code, scope, entity_id, entity_prefix, entity_names,
+        range_type, start_date, end_date,
     ) = prompt_config()
     call_create_start, call_create_end = calculate_date_range(
         range_type, start_date, end_date
@@ -597,7 +602,11 @@ def main():
     client = authenticate()
 
     # Master department list
-    all_entities = fetch_all_entities(client, state_code, entity_id)
+    all_entities = fetch_all_entities(client, state_code)
+    try:
+        all_entities = select_entities(all_entities, scope, entity_id, entity_prefix, entity_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
     all_entities = {
         department_id: name
         for department_id, name in all_entities.items()
@@ -610,6 +619,11 @@ def main():
 
     if not all_eids:
         sys.exit("✗ No fetched departments matched the embedded county prefixes.")
+    if scope != "statewide":
+        county_names = {
+            prefix: name for prefix, name in county_names.items()
+            if any(eid.upper().startswith(prefix) for eid in all_eids)
+        }
 
     print(f"\nDate range: {range_type}")
     if call_create_start:

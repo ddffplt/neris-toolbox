@@ -201,6 +201,7 @@ def read_simultaneous_rows(path):
     """Read the simultaneous-calls Overview sheet, rebuilding its formula-driven Eastern columns."""
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
     rows = list(workbook["Overview"].iter_rows(values_only=True))
+    workbook.close()
     headers = list(rows[0])
     call_index = headers.index(CALL_DATE) if CALL_DATE in headers else None
     eastern_headers = {EASTERN + suffix: suffix for suffix in
@@ -209,7 +210,7 @@ def read_simultaneous_rows(path):
     by_entity = {}
     id_index = headers.index(SIMULTANEOUS_ID)
     for row in rows[1:]:
-        if not row or not row[id_index]:
+        if not row or not row[id_index] or not ENTITY_ID.fullmatch(str(row[id_index])):
             continue
         values = list(row)
         eastern = utc_to_eastern(values[call_index]) if call_index is not None else None
@@ -256,22 +257,25 @@ def classify_files(files):
     classified = {}
     for path in files:
         workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheets = set(workbook.sheetnames)
-        if "Entity Fire Reports" in sheets:
-            category = "fire"
-        elif "Entity Aid Reports" in sheets:
-            category = "aid"
-        elif "Entity Smoke Alarm Reports" in sheets:
-            category = "smoke"
-        elif "Incident Type Summary" in sheets:
-            category = "types"
-        elif "Monthly Incident Counts" in sheets:
-            category = "monthly"
-        elif "Overview" in sheets and is_simultaneous_overview(workbook["Overview"]):
-            category = "simultaneous"
-        else:
-            print(f"Skipping unrecognized workbook: {path.name}")
-            continue
+        try:
+            sheets = set(workbook.sheetnames)
+            if "Entity Fire Reports" in sheets:
+                category = "fire"
+            elif "Entity Aid Reports" in sheets:
+                category = "aid"
+            elif "Entity Smoke Alarm Reports" in sheets:
+                category = "smoke"
+            elif "Incident Type Summary" in sheets:
+                category = "types"
+            elif "Monthly Incident Counts" in sheets:
+                category = "monthly"
+            elif "Overview" in sheets and is_simultaneous_overview(workbook["Overview"]):
+                category = "simultaneous"
+            else:
+                print(f"Skipping unrecognized workbook: {path.name}")
+                continue
+        finally:
+            workbook.close()
         if category in classified:
             raise ValueError(f"More than one {category} report selected; select only one of each type.")
         classified[category] = path

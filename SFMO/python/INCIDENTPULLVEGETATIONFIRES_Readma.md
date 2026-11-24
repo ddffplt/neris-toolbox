@@ -1,5 +1,8 @@
 IncidentPull_VegetationFires — Run instructions
 
+Interactive query scope: choose the entire state, an MA FD25 county prefix,
+one entity, or multiple comma-separated entity IDs or names.
+
 This script fetches NERIS incidents filtered to vegetation/wildfire Outside Fire types and exports an Excel workbook.
 
 Important notes

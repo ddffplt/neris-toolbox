@@ -89,7 +89,7 @@ def parse_cli_args():
     return parser.parse_args()
 
 
-def prompt_config():
+def prompt_config(state_code="MA"):
     print("\n" + "=" * 60)
     print("  NERIS Incident Export Tool")
     print("=" * 60)
@@ -97,35 +97,11 @@ def prompt_config():
     print("\n── Credentials ──────────────────────────────────")
 
     print("\n── Query Parameters ─────────────────────────────")
-    print("\nEntity Scope Options:")
-    print("  1. One entity")
-    print("  2. Entities in an FD25 county prefix")
-    print("  3. Entire state")
-    while True:
-        scope_choice = input("Select entity scope [1]: ").strip() or "1"
-        if scope_choice in {"1", "2", "3"}:
-            break
-        print("  Invalid selection, choose 1, 2, or 3.")
-
-    entity_id = None
-    entity_prefix = None
-    entity_scope = "entity"
-    if scope_choice == "1":
-        entity_id = input("NERIS Entity ID (e.g. FD26163151): ").strip()
-        if not entity_id:
-            print("  An entity ID is required for this scope.")
-            return prompt_config()
-    elif scope_choice == "2":
-        while True:
-            entity_prefix = normalize_fd25_prefix(
-                input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")
-            )
-            if entity_prefix:
-                break
-            print("  Invalid prefix. Use FD25 followed by an odd county code from 001 through 027, such as FD25001*.")
-        entity_scope = "fd25_prefix"
-    else:
-        entity_scope = "statewide"
+    from prompt_snippets import prompt_entity_scope
+    try:
+        entity_scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for i, opt in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -154,7 +130,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return entity_id, entity_prefix, entity_scope, range_type, start_date, end_date
+    return entity_id, entity_prefix, entity_names, entity_scope, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -263,7 +239,8 @@ def get_department_incidents(client, neris_id_entity,
     return all_incidents
 
 
-def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None, entity_prefix=None):
+def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None, entity_prefix=None,
+                            entity_scope="statewide", entity_id=None, entity_names=None):
     """Fetch incidents by enumerating entities and aggregating per-entity results.
     This avoids making a single unrestricted 'list_incidents' call which may be forbidden.
     If 'state' is provided, it will be used when listing entities.
@@ -299,11 +276,17 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
         traceback.print_exc()
         return [], []
 
-    if entity_prefix:
-        entities = [
-            entity for entity in entities
-            if str(entity.get('neris_id', '')).startswith(entity_prefix)
-        ]
+    from prompt_snippets import select_entities
+    if entity_prefix and entity_scope == "statewide":
+        entity_scope = "fd25_prefix"
+    try:
+        selected = select_entities(
+            {ent["neris_id"]: ent.get("name", "") for ent in entities if ent.get("neris_id")},
+            entity_scope, entity_id, entity_prefix, entity_names,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    entities = [{"neris_id": eid, "name": name} for eid, name in selected.items()]
     print(f"\nFound {len(entities)} entities to query")
 
     aggregated = []
@@ -989,9 +972,12 @@ def main():
     ])
 
     if cli_used:
+        entity_names = []
         entity_prefix = normalize_fd25_prefix(args.fd25_prefix)
         if args.fd25_prefix and not entity_prefix:
             sys.exit("✗ Invalid FD25 prefix. Use FD25 followed by an odd county code from 001 through 027, such as FD25001*.")
+        if entity_prefix and args.state and args.state.upper() != "MA":
+            sys.exit("FD25 county prefixes are only available for Massachusetts (MA).")
         if entity_prefix:
             entity_scope = "fd25_prefix"
             entity_id = None
@@ -1009,9 +995,9 @@ def main():
         page_size = args.page_size or 100
     else:
         (
-            entity_id, entity_prefix, entity_scope,
+            entity_id, entity_prefix, entity_names, entity_scope,
             range_type, start_date, end_date,
-        ) = prompt_config()
+        ) = prompt_config(args.state or "MA")
         max_incidents = None
         page_size = 100
 
@@ -1025,7 +1011,7 @@ def main():
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
     all_entity_ids = [entity_id] if entity_id else []
 
-    if entity_scope == "entity":
+    if entity_scope == "entity" and (cli_used or entity_id.upper().startswith("FD")):
         incidents = get_department_incidents(
             client,
             entity_id,
@@ -1047,7 +1033,7 @@ def main():
         # Default to Massachusetts for the full statewide interactive run.
         if (
             state_param is None
-            and entity_scope == "statewide"
+            and (entity_scope != "fd25_prefix" or not getattr(args, "national", False))
             and not ('args' in locals() and getattr(args, 'national', False))
         ):
             state_param = 'MA'
@@ -1061,6 +1047,9 @@ def main():
             page_size=page_size,
             state=state_param,
             entity_prefix=entity_prefix if entity_scope == "fd25_prefix" else None,
+            entity_scope=entity_scope,
+            entity_id=entity_id,
+            entity_names=entity_names,
         )
 
     vegetation_incident_types = {
@@ -1090,7 +1079,7 @@ def main():
     if not incidents:
         print("⚠ No incidents found for the given parameters (after filtering to approved vegetation incident types).")
 
-    export_to_excel(incidents, client, department_id=entity_id, entity_ids=all_entity_ids)
+    export_to_excel(incidents, client, department_id=all_entity_ids[0] if entity_scope == "entity" and all_entity_ids else (entity_id if cli_used else None), entity_ids=all_entity_ids)
 
     print("\n" + "=" * 60)
     print("  PROCESS COMPLETE")

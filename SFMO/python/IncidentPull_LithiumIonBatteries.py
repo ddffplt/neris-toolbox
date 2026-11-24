@@ -77,7 +77,7 @@ def parse_cli_args():
     return parser.parse_args()
 
 
-def prompt_config():
+def prompt_config(state_code="MA"):
     print("\n" + "=" * 60)
     print("  NERIS Lithium-ion Battery Fires Report")
     print("=" * 60)
@@ -85,10 +85,11 @@ def prompt_config():
     print("\n── Credentials ──────────────────────────────────")
 
     print("\n── Query Parameters ─────────────────────────────")
-    print("Enter a NERIS Entity ID (e.g. FD26163151) to fetch incidents for a single department.")
-    print("Leave blank to fetch incidents for the entire state (no department filter).")
-    entity_id_raw = input("NERIS Entity ID (or leave blank for statewide): ").strip()
-    entity_id = entity_id_raw if entity_id_raw else None
+    from prompt_snippets import prompt_entity_scope
+    try:
+        entity_scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for i, opt in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -117,7 +118,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return entity_id, range_type, start_date, end_date
+    return entity_scope, entity_id, entity_prefix, entity_names, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -248,7 +249,8 @@ def get_department_incidents(client, neris_id_entity,
     return all_incidents
 
 
-def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None):
+def get_statewide_incidents(client, call_create_start=None, call_create_end=None, max_incidents=None, page_size=100, state=None,
+                            entity_scope="statewide", entity_id=None, county_prefix=None, entity_names=None):
     """Fetch statewide incidents by querying each registered entity."""
     print("\nAttempting statewide fetch by enumerating entities...")
 
@@ -288,6 +290,16 @@ def get_statewide_incidents(client, call_create_start=None, call_create_end=None
         traceback.print_exc()
         return [], []
 
+    from prompt_snippets import select_entities
+    try:
+        selected = select_entities(
+            {ent["neris_id"]: ent.get("name", "") for ent in entities},
+            entity_scope, entity_id, county_prefix, entity_names,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    entities = [{"neris_id": eid, "name": name} for eid, name in selected.items()]
+    all_entity_ids = list(selected)
     print(f"\nFound {len(entities)} entities to query")
 
     aggregated = []
@@ -792,6 +804,7 @@ def main():
     ])
 
     if cli_used:
+        entity_scope, entity_prefix, entity_names = "statewide", None, []
         entity_id = None if args.statewide else (args.entity_id or None)
         range_type = args.range_type or "All Records"
         start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
@@ -799,11 +812,11 @@ def main():
         max_incidents = args.max_incidents
         page_size = args.page_size or 100
     else:
-        entity_id, range_type, start_date, end_date = prompt_config()
+        entity_scope, entity_id, entity_prefix, entity_names, range_type, start_date, end_date = prompt_config(args.state or "MA")
         max_incidents = None
         page_size = 100
 
-    if not entity_id:
+    if entity_scope == "statewide" and not entity_id:
         print("No NERIS Entity ID provided — running statewide (no entity filter).")
 
     client = authenticate()
@@ -811,7 +824,7 @@ def main():
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
     all_entity_ids = [entity_id] if entity_id else []
 
-    if entity_id:
+    if entity_id and (cli_used or entity_id.upper().startswith("FD")):
         incidents = get_department_incidents(
             client,
             entity_id,
@@ -833,13 +846,17 @@ def main():
             state_param = 'MA'
             print("No state specified — defaulting to MA (Massachusetts) for statewide run.")
 
-        incidents = get_statewide_incidents(
+        incidents, all_entity_ids = get_statewide_incidents(
             client,
             call_create_start=start_filter,
             call_create_end=end_filter,
             max_incidents=max_incidents,
             page_size=page_size,
             state=state_param,
+            entity_scope=entity_scope,
+            entity_id=entity_id,
+            county_prefix=entity_prefix,
+            entity_names=entity_names,
         )
 
     fetched_before_date_filter = len(incidents)
@@ -875,7 +892,7 @@ def main():
     if not incidents:
         print("⚠ No incidents found matching lithium-ion battery fire criteria.")
 
-    export_to_excel(incidents, client, department_id=entity_id, range_type=range_type, start_date=start_date, end_date=end_date, entity_ids=all_entity_ids)
+    export_to_excel(incidents, client, department_id=all_entity_ids[0] if entity_scope == "entity" and all_entity_ids else (entity_id if cli_used else None), range_type=range_type, start_date=start_date, end_date=end_date, entity_ids=all_entity_ids)
 
     print("\n" + "=" * 60)
     print("  PROCESS COMPLETE")

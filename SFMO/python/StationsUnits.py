@@ -146,6 +146,11 @@ def main():
         sys.exit(1)
  
     state = STATE.strip().upper()
+    from prompt_snippets import prompt_entity_scope, select_entities
+    try:
+        scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state)
+    except ValueError as exc:
+        sys.exit(str(exc))
  
     export_dir = os.path.dirname(OUTPUT_FILE)
     if export_dir:
@@ -161,6 +166,15 @@ def main():
     if not entities:
         print("No entities returned -- check credentials.")
         sys.exit(1)
+
+    try:
+        selected = select_entities(
+            {entity["neris_id"]: entity.get("name", "") for entity in entities if entity.get("neris_id")},
+            scope, entity_id, entity_prefix, entity_names,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    entities = [entity for entity in entities if entity.get("neris_id") in selected]
  
     print("-- Step 2: Fetching unit details for each department --")
     all_rows = []

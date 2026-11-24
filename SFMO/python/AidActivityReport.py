@@ -5,8 +5,13 @@
 import os
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from prompt_snippets import prompt_entity_scope, select_entities
+
+# Temporarily disable the separate statewide collection for recipient-level details.
+INCLUDE_AID_IN_LIEU_DETAILS = False
 
 DATE_RANGE_OPTIONS = [
     "All Records", "Occurred Today", "Occurred Yesterday",
@@ -59,28 +64,10 @@ def prompt_config():
     print("=" * 60)
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
 
-    print("\nDepartment Scope Options:")
-    print("  1. Entire state")
-    print("  2. County (entity ID prefix)")
-    print("  3. Individual department")
-    while True:
-        scope_choice = input("Select scope [1]: ").strip() or "1"
-        if scope_choice in {"1", "2", "3"}:
-            break
-        print("  Invalid selection, choose 1, 2, or 3.")
-
-    entity_id = None
-    entity_prefix = None
-    if scope_choice == "2":
-        entity_prefix = input("County entity ID prefix (e.g. FD25025): ").strip().upper() or None
-        if not entity_prefix:
-            print("  A prefix is required for this scope.")
-            return prompt_config()
-    elif scope_choice == "3":
-        entity_id = input("NERIS Entity ID (e.g. FD26163151): ").strip() or None
-        if not entity_id:
-            print("  An entity ID is required for this scope.")
-            return prompt_config()
+    try:
+        scope, entity_id, entity_prefix, selected_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for number, option in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -111,7 +98,7 @@ def prompt_config():
 
     if not state_code:
         sys.exit("State code is required.")
-    return state_code, entity_id, entity_prefix, range_type, start_date, end_date
+    return state_code, scope, entity_id, entity_prefix, selected_names, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -158,6 +145,42 @@ def authenticate():
     return authenticate_with_fallback()
 
 
+class IncidentFetchError(RuntimeError):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class EntityFetchError(RuntimeError):
+    pass
+
+
+def _list_incidents_with_retry(client, entity_id, params):
+    max_retries = 5
+    for attempt in range(max_retries + 1):
+        error = None
+        try:
+            response = client.list_incidents(**params)
+            status_code = getattr(response, "status_code", None)
+        except Exception as exc:
+            error = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            if status_code != 504:
+                raise
+
+        if status_code != 504:
+            return response
+        if attempt == max_retries:
+            raise IncidentFetchError(
+                f"NERIS API returned HTTP 504 while retrieving incidents for {entity_id} "
+                f"after {max_retries} retries. Try running the report again later.",
+                504,
+            ) from error
+        wait = 5 * 2 ** attempt
+        print(f"  HTTP 504 for {entity_id}; retry {attempt + 1}/{max_retries} in {wait}s...")
+        time.sleep(wait)
+
+
 def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_size=100):
     # neris_id_entity already scopes the query; adding "state" alongside it can trigger
     # spurious 403s if the entity's registered state record doesn't exactly match state_code.
@@ -176,30 +199,46 @@ def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_si
             if cursor:
                 params["cursor"] = cursor
         try:
-            response = client.list_incidents(**params)
-            status_code = getattr(response, "status_code", None)
-            if status_code in (401, 403):
-                if cursor and not cursor_only:
-                    print("  API rejected the continuation cursor with filters; retrying with cursor only.")
-                    cursor_only = True
-                    continue
-                try:
-                    detail = response.json()
-                except Exception:
-                    detail = getattr(response, "text", "")
-                raise RuntimeError(
-                    f"NERIS API returned HTTP {status_code} while retrieving incidents for {entity_id}: {detail}"
-                )
-            response = response if isinstance(response, dict) else response.json()
+            response = _list_incidents_with_retry(client, entity_id, params)
+        except IncidentFetchError:
+            raise
         except Exception as error:
             status_code = getattr(getattr(error, "response", None), "status_code", None)
-            if isinstance(error, RuntimeError) and "NERIS API returned HTTP 403" in str(error):
-                raise
-            raise RuntimeError(
-                f"Unable to retrieve incidents for {entity_id}"
-                f" (HTTP {status_code})" if status_code else
-                f"Unable to retrieve incidents for {entity_id}: {error}"
-            ) from error
+            if status_code in (401, 403) and cursor and not cursor_only:
+                print("  API rejected the continuation cursor with filters; retrying with cursor only.")
+                cursor_only = True
+                continue
+            if status_code is not None:
+                raise IncidentFetchError(
+                    f"NERIS API returned HTTP {status_code} while retrieving incidents for {entity_id}.",
+                    status_code,
+                ) from error
+            raise IncidentFetchError(f"Unable to retrieve incidents for {entity_id}: {error}") from error
+
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None and status_code >= 400:
+            if status_code in (401, 403) and cursor and not cursor_only:
+                print("  API rejected the continuation cursor with filters; retrying with cursor only.")
+                cursor_only = True
+                continue
+            raise IncidentFetchError(
+                f"NERIS API returned HTTP {status_code} while retrieving incidents for {entity_id}.",
+                status_code,
+            )
+        if not isinstance(response, dict):
+            try:
+                response = response.json()
+            except (AttributeError, ValueError) as error:
+                status = f"HTTP {status_code}" if status_code is not None else "HTTP status unavailable"
+                raise IncidentFetchError(
+                    f"NERIS API returned a response that was not valid JSON while retrieving "
+                    f"incidents for {entity_id} ({status})."
+                ) from error
+        if not isinstance(response, dict) or not isinstance(response.get("incidents"), list):
+            raise IncidentFetchError(
+                f"NERIS API returned an unexpected incident response for {entity_id}: "
+                "expected an object containing an incidents list."
+            )
         batch = response.get("incidents", [])
         if not batch:
             break
@@ -220,10 +259,60 @@ def fetch_entities(client, state_code, entity_id):
             return {entity_id: ""}
     entities = {}
     page = 1
+    from requests.exceptions import RequestException
+
     while True:
-        response = client.list_entities(state=state_code, page_size=100, page_number=page)
-        response = response if isinstance(response, dict) else response.json()
-        batch = response.get("entities", [])
+        max_retries = 5
+        for attempt in range(max_retries + 1):
+            error = None
+            try:
+                response = client.list_entities(state=state_code, page_size=100, page_number=page)
+                status_code = getattr(response, "status_code", None)
+            except RequestException as exc:
+                error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code is None:
+                    raise EntityFetchError(
+                        f"Unable to retrieve entities for {state_code} (page {page}): {exc}"
+                    ) from exc
+
+            if status_code not in (503, 504):
+                if status_code is not None and status_code >= 400:
+                    raise EntityFetchError(
+                        f"NERIS API returned HTTP {status_code} while retrieving entities "
+                        f"for {state_code} (page {page})."
+                    ) from error
+                if error is not None:
+                    raise EntityFetchError(
+                        f"Unable to retrieve entities for {state_code} (page {page}): {error}"
+                    ) from error
+                break
+            if attempt == max_retries:
+                raise EntityFetchError(
+                    f"NERIS API returned HTTP {status_code} while retrieving entities for "
+                    f"{state_code} (page {page}) after {max_retries} retries. "
+                    "Try running the report again later."
+                ) from error
+            wait = 5 * 2 ** attempt
+            print(f"  HTTP {status_code} for {state_code} entities, page {page}; "
+                  f"retry {attempt + 1}/{max_retries} in {wait}s...")
+            time.sleep(wait)
+
+        if not isinstance(response, dict):
+            try:
+                response = response.json()
+            except (AttributeError, ValueError) as error:
+                status = f"HTTP {status_code}" if status_code is not None else "HTTP status unavailable"
+                raise EntityFetchError(
+                    f"NERIS API returned a response that was not valid JSON while retrieving "
+                    f"entities for {state_code} (page {page}; {status})."
+                ) from error
+        if not isinstance(response, dict) or not isinstance(response.get("entities"), list):
+            raise EntityFetchError(
+                f"NERIS API returned an unexpected entity response for {state_code} "
+                f"(page {page}): expected an object containing an entities list."
+            )
+        batch = response["entities"]
         if not batch:
             break
         for entity in batch:
@@ -335,16 +424,19 @@ def aggregate(incidents, entity_names):
 
 
 def collect_aid_in_lieu(client, incidents, entity_names, name_cache):
-    """Group incidents by the recipient entity that other departments reported as aid given in lieu of."""
+    """Group other departments' reports by recipient within the selected entities."""
     aid_in_lieu = defaultdict(list)
     for incident in incidents:
         giver_id = (incident.get("base") or {}).get("department_neris_id", "")
+        recipients_seen = set()
         for aid in _normalized_aids(incident):
             if aid["direction"] != "GIVEN" or aid["type"] != "IN_LIEU_AID":
                 continue
             recipient_id = aid["entity_id"]
-            if not recipient_id:
+            if (recipient_id not in entity_names or not giver_id or recipient_id == giver_id
+                    or recipient_id in recipients_seen):
                 continue
+            recipients_seen.add(recipient_id)
             giver_name = entity_names.get(giver_id) or resolve_entity_name(client, giver_id, name_cache)
             aid_in_lieu[recipient_id].append(_overview_fields(incident, giver_name))
     return aid_in_lieu
@@ -372,7 +464,7 @@ def _eastern_formula(utc_cell):
 
 
 def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, state_code,
-                 range_label="selected-range"):
+                 range_label="selected-range", fetch_errors=None, fetch_entity_names=None):
     from openpyxl import Workbook  # type: ignore[import-not-found]
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # type: ignore[import-not-found]
     from openpyxl.utils import get_column_letter  # type: ignore[import-not-found]
@@ -385,8 +477,13 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
     os.makedirs(os.path.dirname(path), exist_ok=True)
     workbook = Workbook()
     workbook.remove(workbook.active)
+    fetch_errors = fetch_errors or {}
+    if fetch_entity_names is None:
+        fetch_entity_names = entity_names
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
+    error_fill = PatternFill("solid", fgColor="FFC7CE")
+    error_font = Font(color="9C0006", bold=True)
     border = Border(*(Side(style="thin", color="B7C9D6") for _ in range(4)))
     heading_border = Border(*(Side(style="thin", color="000000") for _ in range(4)))
 
@@ -428,10 +525,18 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
         values = summary.get(entity_id, {column: 0 for column in METRIC_COLUMNS})
         row = [entity_id, entity_names.get(entity_id, "")]
         for column in METRIC_COLUMNS:
-            row.append(values[column])
+            row.append(None if entity_id in fetch_errors else values[column])
         summary_sheet.append(row)
         for column_index, column in enumerate(summary_headers, 1):
             apply_value_format(summary_sheet.cell(summary_sheet.max_row, column_index), column)
+        if entity_id in fetch_errors:
+            summary_sheet.cell(summary_sheet.max_row, len(summary_headers) + 1, "Data unavailable - see Fetch Issues")
+            for cell in summary_sheet[summary_sheet.max_row]:
+                cell.fill = error_fill
+                cell.font = error_font
+    if fetch_errors:
+        summary_sheet.cell(1, len(summary_headers) + 1, "Fetch Status")
+        style_header_row(summary_sheet, 1)
     summary_sheet.row_dimensions[1].height = 48
     autosize(summary_sheet, 2)
 
@@ -482,7 +587,15 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
             elif column_index == 2:
                 cell.font = Font(bold=True, size=12)
                 cell.alignment = Alignment(vertical="center", horizontal="left", wrap_text=True)
-        append_detail_table(entity_id)
+        if entity_id in fetch_errors:
+            for cell in detail_sheet[heading_row][:5]:
+                cell.fill = error_fill
+                cell.font = error_font
+            detail_sheet.append(["Data unavailable - see Fetch Issues. No incidents from this entity are included."])
+            detail_sheet.cell(detail_sheet.max_row, 1).fill = error_fill
+            detail_sheet.cell(detail_sheet.max_row, 1).font = error_font
+        else:
+            append_detail_table(entity_id)
 
     for row_number in range(1, detail_sheet.max_row + 1):
         if detail_sheet.cell(row_number, 1).value == "Incident Type":
@@ -491,8 +604,17 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
 
     # ── Aid Given In Lieu Of sheet: incidents other entities reported giving in lieu of, by recipient ──
     lieu_sheet = workbook.create_sheet("Aid Given In Lieu Of")
-    recipient_ids = sorted(aid_in_lieu)
-    if not recipient_ids:
+    if not INCLUDE_AID_IN_LIEU_DETAILS:
+        lieu_sheet.append(["Aid Given In Lieu Of incident details are temporarily disabled."])
+    elif fetch_errors:
+        lieu_sheet.append([
+            "Incomplete: incidents from entities listed in Fetch Issues are excluded; "
+            "aid given in lieu of may be missing."
+        ])
+        lieu_sheet["A1"].font = Font(bold=True, color="9C0006")
+        lieu_sheet.append([])
+    recipient_ids = sorted(aid_in_lieu) if INCLUDE_AID_IN_LIEU_DETAILS else []
+    if INCLUDE_AID_IN_LIEU_DETAILS and not recipient_ids:
         lieu_sheet.append(["No aid-given-in-lieu-of incidents found for the selected scope and date range."])
     for entity_index, recipient_id in enumerate(recipient_ids):
         if entity_index:
@@ -534,19 +656,54 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
     for row_number in range(1, lieu_sheet.max_row + 1):
         if lieu_sheet.cell(row_number, 1).value == "Incident NERIS ID":
             lieu_sheet.row_dimensions[row_number].height = 32
+    if INCLUDE_AID_IN_LIEU_DETAILS:
+        lieu_sheet.append([])
+        lieu_sheet.append([
+            f"Reporting scope: incidents reported by entities in {state_code} only; "
+            "aid reported by out-of-state entities is not included."
+        ])
     autosize(lieu_sheet, 2, skip_columns={2})
+
+    if fetch_errors:
+        issues_sheet = workbook.create_sheet("Fetch Issues")
+        issues_sheet.append(["Entity ID", "Department Name", "Error", "Impact"])
+        style_header_row(issues_sheet, 1)
+        for entity_id, error in sorted(fetch_errors.items()):
+            issues_sheet.append([
+                entity_id, fetch_entity_names.get(entity_id, ""), str(error),
+                "No incidents from this entity are included, even if some pages were fetched.",
+            ])
+        for row in issues_sheet.iter_rows(min_row=2):
+            issues_sheet.row_dimensions[row[0].row].height = 60
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = border
+                cell.fill = error_fill
+                cell.font = error_font
+        issues_sheet.column_dimensions["A"].width = 18
+        issues_sheet.column_dimensions["B"].width = 35
+        issues_sheet.column_dimensions["C"].width = 70
+        issues_sheet.column_dimensions["D"].width = 70
 
     from report_metadata import add_report_sources_sheet
 
+    included_sheets = "Summary, Entity Aid Reports, Aid Given In Lieu Of"
+    if fetch_errors:
+        included_sheets += ", Fetch Issues"
     add_report_sources_sheet(
         workbook,
         "AidActivityReport.py",
         range_label,
         [
             ("State code", state_code),
-            ("Included sheets", "Summary, Entity Aid Reports, Aid Given In Lieu Of"),
+            ("Included sheets", included_sheets),
             ("Incident scope", "Incidents with at least one aid given or received record"),
-            ("Aid Given In Lieu Of scope", "Incidents reported by other entities as aid given in lieu of, grouped by recipient"),
+            ("Aid Given In Lieu Of scope",
+             f"Incidents reported by other entities in {state_code}, grouped by selected recipient; "
+             "out-of-state reporting entities are not included" if INCLUDE_AID_IN_LIEU_DETAILS
+             else "Incident details temporarily disabled; aggregate aid counts are still included."),
+            ("Fetch status", f"Incomplete: {len(fetch_errors)} entities could not be retrieved; see Fetch Issues."
+             if fetch_errors else "Complete"),
         ],
     )
 
@@ -556,47 +713,72 @@ def export_excel(detail, summary, aid_in_lieu, entity_names, recipient_names, st
 
 def main():
     ensure_dependencies()
-    state_code, entity_id, entity_prefix, range_type, start_date, end_date = prompt_config()
+    state_code, scope, entity_id, entity_prefix, selected_names, range_type, start_date, end_date = prompt_config()
     start, end = calculate_date_range(range_type, start_date, end_date)
     client = authenticate()
-    entity_names = fetch_entities(client, state_code, entity_id)
-    if entity_prefix:
-        entity_names = {
-            eid: name for eid, name in entity_names.items()
-            if str(eid).upper().startswith(entity_prefix)
-        }
+    try:
+        all_entities = fetch_entities(client, state_code, None)
+    except EntityFetchError as exc:
+        sys.exit(str(exc))
+    try:
+        entity_names = select_entities(all_entities, scope, entity_id, entity_prefix, selected_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    reporting_entity_names = dict(all_entities) if INCLUDE_AID_IN_LIEU_DETAILS else {}
     incidents = []
-    for current_entity in entity_names:
+    reporting_incidents = []
+    fetch_errors = {}
+    fetch_entity_names = dict(entity_names)
+    fetch_entity_names.update(reporting_entity_names)
+    for current_entity in fetch_entity_names:
         print(f"Fetching {current_entity}...")
         try:
-            incidents.extend(fetch_incidents(client, state_code, current_entity, start, end))
-        except RuntimeError as error:
-            if "HTTP 403" in str(error):
-                print(f"  Skipping {current_entity}: account is not authorized to retrieve this entity.")
-                continue
-            raise
-    if not entity_names:
-        print("No departments found for the selected state/entity.")
-        return
-
+            fetched = fetch_incidents(client, state_code, current_entity, start, end)
+            if current_entity in reporting_entity_names:
+                reporting_incidents.extend(fetched)
+            if current_entity in entity_names:
+                incidents.extend(fetched)
+        except IncidentFetchError as error:
+            fetch_errors[current_entity] = str(error)
+            print(f"  Could not retrieve {current_entity}: {error} Continuing; see Fetch Issues in the report.")
     detail, summary, aid_incidents, entity_names = aggregate(incidents, entity_names)
 
-    name_cache = dict(entity_names)
-    aid_in_lieu = collect_aid_in_lieu(client, aid_incidents, entity_names, name_cache)
-    recipient_names = {
-        recipient_id: name_cache.get(recipient_id) or resolve_entity_name(client, recipient_id, name_cache)
-        for recipient_id in aid_in_lieu
-    }
+    aid_in_lieu = {}
+    recipient_names = {}
+    if INCLUDE_AID_IN_LIEU_DETAILS:
+        name_cache = dict(reporting_entity_names)
+        recipients = {
+            eid: name for eid, name in entity_names.items()
+            if state_code != "MA" or str(eid).upper().startswith("FD25")
+        }
+        aid_in_lieu = collect_aid_in_lieu(client, reporting_incidents, recipients, name_cache)
+        recipient_names = {
+            recipient_id: name_cache.get(recipient_id) or resolve_entity_name(client, recipient_id, name_cache)
+            for recipient_id in aid_in_lieu
+        }
 
     range_label = date_range_label(range_type, start_date, end_date)
     path = export_excel(
-        detail, summary, aid_in_lieu, entity_names, recipient_names, state_code, range_label
+        detail, summary, aid_in_lieu, entity_names, recipient_names, state_code, range_label, fetch_errors,
+        fetch_entity_names,
     )
     print(f"\nExported: {path}")
     print(f"Incidents retrieved: {len(incidents)}")
     print(f"Aid incidents: {len(aid_incidents)}; detail rows: {len(detail)}; departments: {len(entity_names)}")
-    print(f"Aid given in lieu of — recipient entities: {len(aid_in_lieu)}")
+    if INCLUDE_AID_IN_LIEU_DETAILS:
+        print(f"Aid given in lieu of — recipient entities: {len(aid_in_lieu)}")
+    else:
+        print("Aid Given In Lieu Of incident details are temporarily disabled.")
+    if fetch_errors:
+        print(f"Warning: {len(fetch_errors)} entities could not be retrieved. See Fetch Issues in the report.")
 
 
 if __name__ == "__main__":
-    main()
+    started_at = time.perf_counter()
+    try:
+        main()
+    finally:
+        elapsed = time.perf_counter() - started_at
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"\nTotal runtime: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f} (hh:mm:ss)")

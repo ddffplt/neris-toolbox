@@ -9,6 +9,7 @@ import time
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from prompt_snippets import prompt_entity_scope, select_entities
 
 DATE_RANGE_OPTIONS = [
     "All Records", "Occurred Today", "Occurred Yesterday",
@@ -62,10 +63,10 @@ def prompt_config():
     print("  NERIS Fire Activity Report by Entity")
     print("=" * 60)
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
-    entity_prefix = input("Entity ID prefix filter (optional, e.g. FD25025): ").strip() or None
-    entity_id = None
-    if not entity_prefix:
-        entity_id = input("NERIS Entity ID (optional): ").strip() or None
+    try:
+        scope, entity_id, entity_prefix, selected_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for number, option in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -96,7 +97,7 @@ def prompt_config():
 
     if not state_code:
         sys.exit("State code is required.")
-    return state_code, entity_id, entity_prefix, range_type, start_date, end_date
+    return state_code, scope, entity_id, entity_prefix, selected_names, range_type, start_date, end_date
 
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
@@ -174,6 +175,8 @@ def fetch_incidents(client, state_code, entity_id, start=None, end=None, page_si
                 print(f"  HTTP {status_code}; retry {retries}/{max_retries} in {wait}s...")
                 time.sleep(wait)
                 continue
+            if status_code is not None and status_code >= 400:
+                raise RuntimeError(f"NERIS API returned HTTP {status_code} for {entity_id}.")
             retries = 0
             response = response if isinstance(response, dict) else response.json()
         except Exception as error:
@@ -349,10 +352,13 @@ def aggregate(incidents, entity_names):
 
 
 def export_excel(detail, detail_types, summary, summary_types, entity_names, state_code,
-                 range_label="selected-range"):
+                 range_label="selected-range", fetch_errors=None):
     from openpyxl import Workbook  # type: ignore[import-not-found]
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # type: ignore[import-not-found]
     from openpyxl.utils import get_column_letter  # type: ignore[import-not-found]
+    from report_metadata import add_fetch_issues_sheet, highlight_fetch_issue
+
+    fetch_errors = fetch_errors or {}
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(
@@ -398,7 +404,7 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
             value = total_values[column]
             if column == "Acres Burned":
                 value = math.ceil((value - 1e-12) * 100) / 100
-            row.append(value)
+            row.append(None if entity_id in fetch_errors else value)
         summary_sheet.append(row)
         for column_index, column in enumerate(summary_headers, 1):
             cell = summary_sheet.cell(summary_sheet.max_row, column_index)
@@ -409,6 +415,15 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
                 cell.number_format = '#,##0.00;(#,##0.00);-'
             elif column in METRIC_COLUMNS:
                 cell.number_format = '#,##0;(#,##0);-'
+        if entity_id in fetch_errors:
+            summary_sheet.cell(summary_sheet.max_row, len(summary_headers) + 1,
+                               "Data unavailable - see Fetch Issues")
+            highlight_fetch_issue(summary_sheet[summary_sheet.max_row])
+
+    if fetch_errors:
+        summary_sheet.cell(1, len(summary_headers) + 1, "Fetch Status")
+        style_header_row(summary_sheet, 1)
+        summary_sheet.column_dimensions[get_column_letter(len(summary_headers) + 1)].width = 38
 
     for row_number in range(1, summary_sheet.max_row + 1):
         if summary_sheet.cell(row_number, 1).value in ("Entity ID",):
@@ -499,9 +514,14 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
             merged_cell = sheet.cell(heading_row, column_index)
             merged_cell.fill = PatternFill("solid", fgColor="D9EAF7")
             merged_cell.border = heading_border
-        append_table(detail, detail_types, "detail", entity_id)
-        sheet.append([])
-        append_table(summary, summary_types, "summary", entity_id)
+        if entity_id in fetch_errors:
+            highlight_fetch_issue(sheet[heading_row][:5])
+            sheet.append(["Data unavailable - see Fetch Issues. No incidents from this entity are included."])
+            highlight_fetch_issue(sheet[sheet.max_row][:1])
+        else:
+            append_table(detail, detail_types, "detail", entity_id)
+            sheet.append([])
+            append_table(summary, summary_types, "summary", entity_id)
 
     for row_number in range(1, sheet.max_row + 1):
         if sheet.cell(row_number, 1).value in ("Fire Incident Type", "Fire Summary Type"):
@@ -538,14 +558,18 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
         sheet.column_dimensions[column_letter].width = max(8, min(longest_value + 2, 40))
     from report_metadata import add_report_sources_sheet
 
+    add_fetch_issues_sheet(workbook, fetch_errors, entity_names)
     add_report_sources_sheet(
         workbook,
         "EntityFireActivityReport.py",
         range_label,
         [
             ("State code", state_code),
-            ("Included sheets", "Entity Fire Reports, Summary"),
+            ("Included sheets", "Entity Fire Reports, Summary"
+             + (", Fetch Issues" if fetch_errors else "")),
             ("Summary scope", "One total-fires row per department"),
+            ("Fetch status", f"Incomplete: {len(fetch_errors)} entities could not be retrieved; see Fetch Issues."
+             if fetch_errors else "Complete"),
         ],
     )
 
@@ -555,38 +579,30 @@ def export_excel(detail, detail_types, summary, summary_types, entity_names, sta
 
 def main():
     ensure_dependencies()
-    state_code, entity_id, entity_prefix, range_type, start_date, end_date = prompt_config()
+    state_code, scope, entity_id, entity_prefix, selected_names, range_type, start_date, end_date = prompt_config()
     start, end = calculate_date_range(range_type, start_date, end_date)
     client = authenticate()
-    entity_names = fetch_entities(client, state_code, entity_id)
-    if entity_prefix:
-        entity_prefix = entity_prefix.upper()
-        entity_names = {
-            eid: name for eid, name in entity_names.items()
-            if str(eid).upper().startswith(entity_prefix)
-        }
-    if entity_id:
-        entity_names = {
-            eid: name for eid, name in entity_names.items()
-            if str(eid) == str(entity_id)
-        }
+    all_entities = fetch_entities(client, state_code, None)
+    try:
+        entity_names = select_entities(all_entities, scope, entity_id, entity_prefix, selected_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
     incidents = []
+    fetch_errors = {}
     for current_entity in entity_names:
         print(f"Fetching {current_entity}...")
         try:
             incidents.extend(fetch_incidents(client, state_code, current_entity, start, end))
         except RuntimeError as error:
-            if "HTTP 403" in str(error):
-                print(f"  Skipping {current_entity}: account is not authorized to retrieve this entity.")
-                continue
-            raise
+            fetch_errors[current_entity] = str(error)
+            print(f"  Could not retrieve {current_entity}: {error}. See Fetch Issues in the report.")
     detail, detail_types, summary, summary_types, entity_names = aggregate(incidents, entity_names)
     if not entity_names:
         print("No departments found for the selected state/entity.")
         return
     range_label = date_range_label(range_type, start_date, end_date)
     path = export_excel(
-        detail, detail_types, summary, summary_types, entity_names, state_code, range_label
+        detail, detail_types, summary, summary_types, entity_names, state_code, range_label, fetch_errors
     )
     print(f"\nExported: {path}")
     print(f"Incidents retrieved: {len(incidents)}")

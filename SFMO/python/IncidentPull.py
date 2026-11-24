@@ -60,6 +60,11 @@ def prompt_config():
 
     print("\n── Query Parameters ─────────────────────────────")
     state_code = input("State Code (e.g. MI, VA, CA): ").strip().upper()
+    from prompt_snippets import prompt_entity_scope
+    try:
+        scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for i, opt in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -88,7 +93,7 @@ def prompt_config():
             except ValueError:
                 print("  Invalid format, use YYYY-MM-DD.")
 
-    return state_code, range_type, start_date, end_date
+    return state_code, scope, entity_id, entity_prefix, entity_names, range_type, start_date, end_date
 
 def calculate_date_range(range_type, start_date=None, end_date=None):
     """Return (call_create_start, call_create_end) as UTC-aware datetimes."""
@@ -703,7 +708,7 @@ def export_to_excel(incidents, client, state_code):
 def main():
     ensure_dependencies()
 
-    state_code, range_type, start_date, end_date = prompt_config()
+    state_code, scope, entity_id, entity_prefix, entity_names, range_type, start_date, end_date = prompt_config()
 
     if not state_code:
         sys.exit("✗ State code is required.")
@@ -712,12 +717,20 @@ def main():
 
     start_filter, end_filter = calculate_date_range(range_type, start_date, end_date)
 
-    incidents = get_state_incidents(
-        client,
-        state_code,
-        call_create_start=start_filter,
-        call_create_end=end_filter,
-    )
+    if scope == "statewide":
+        incidents = get_state_incidents(
+            client, state_code, call_create_start=start_filter, call_create_end=end_filter,
+        )
+    else:
+        from IncidentPullFalseAlarm import get_scoped_incidents
+        try:
+            incidents = get_scoped_incidents(
+                client, state_code, entity_id=entity_id, entity_prefix=entity_prefix,
+                entity_names=entity_names, entity_scope=scope,
+                call_create_start=start_filter, call_create_end=end_filter,
+            )
+        except ValueError as exc:
+            sys.exit(str(exc))
 
     if not incidents:
         print("⚠ No incidents found for the given parameters.")

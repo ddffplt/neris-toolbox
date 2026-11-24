@@ -110,6 +110,8 @@ def prompt_config():
     entity_prefix = None
     entity_names = []
     if scope_choice == "2":
+        if state_code != "MA":
+            sys.exit("FD25 county prefixes are only available for Massachusetts (MA).")
         while True:
             entity_prefix = normalize_fd25_prefix(
                 input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")

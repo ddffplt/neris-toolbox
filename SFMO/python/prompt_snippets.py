@@ -118,7 +118,7 @@ def normalize_fd25_prefix(value):
     return None
 
 
-def prompt_entity_scope():
+def prompt_entity_scope(state_code=None):
     """Return (entity_scope, entity_id, entity_prefix, entity_names)."""
     print("\nEntity Scope Options:")
     print("  1. Entire state")
@@ -135,6 +135,8 @@ def prompt_entity_scope():
     entity_prefix = None
     entity_names = []
     if scope_choice == "2":
+        if state_code and state_code.upper() != "MA":
+            raise ValueError("FD25 county prefixes are only available for Massachusetts (MA).")
         while True:
             entity_prefix = normalize_fd25_prefix(
                 input("FD25 county prefix (FD25001*, FD25003*, ... FD25027*): ")
@@ -160,3 +162,37 @@ def prompt_entity_scope():
         "4": "multiple_entities",
     }[scope_choice]
     return entity_scope, entity_id, entity_prefix, entity_names
+
+
+def select_entities(entities, entity_scope, entity_id=None, entity_prefix=None, entity_names=None):
+    """Select a scope from a mapping of NERIS IDs to entity names."""
+    if entity_scope == "statewide":
+        selected = dict(entities)
+    elif entity_scope == "fd25_prefix":
+        if not normalize_fd25_prefix(entity_prefix):
+            raise ValueError("A valid Massachusetts county prefix is required.")
+        selected = {
+            eid: name for eid, name in entities.items()
+            if str(eid).upper().startswith(entity_prefix.upper().rstrip("*"))
+        }
+    elif entity_scope in {"entity", "multiple_entities"}:
+        requested = [entity_id] if entity_scope == "entity" else (entity_names or [])
+        if not requested or any(not item for item in requested):
+            raise ValueError("At least one entity ID or exact name is required.")
+        selected = {}
+        for item in requested:
+            target = item.strip().casefold()
+            matches = {
+                eid: name for eid, name in entities.items()
+                if str(eid).casefold() == target or str(name).strip().casefold() == target
+            }
+            if not matches:
+                raise ValueError(f"No entity matched {item!r}.")
+            if len(matches) > 1:
+                raise ValueError(f"Entity name {item!r} is ambiguous; use a NERIS ID.")
+            selected.update(matches)
+    else:
+        raise ValueError(f"Unknown entity scope: {entity_scope!r}")
+    if not selected:
+        raise ValueError("No entities matched the selected scope.")
+    return selected

@@ -18,6 +18,7 @@ import os
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from prompt_snippets import prompt_entity_scope, select_entities
 
 
 # ─────────────────────────────────────────────
@@ -64,12 +65,15 @@ def prompt_config():
 
     print("\n-- Query Parameters --")
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
-    entity_id  = input("NERIS Entity ID (optional — leave blank for all departments): ").strip() or None
+    try:
+        scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     if not state_code:
         sys.exit("✗ State code is required.")
 
-    return state_code, entity_id
+    return state_code, scope, entity_id, entity_prefix, entity_names
 
 
 # ─────────────────────────────────────────────
@@ -182,7 +186,10 @@ def fetch_incidents_for_entity(client, state_code, neris_id_entity, page_size=10
 
         res = client.list_incidents(**kwargs)
         if not isinstance(res, dict):
+            res.raise_for_status()
             res = res.json()
+        if not isinstance(res, dict) or not isinstance(res.get("incidents"), list):
+            raise RuntimeError(f"Invalid incident response for {neris_id_entity}.")
 
         batch = res.get("incidents", [])
         if not batch:
@@ -236,7 +243,10 @@ def fetch_nars_for_entity(client, state_code, neris_id_entity, page_size=100):
             params["cursor"] = next_cursor
 
         r   = client._session.get(f"{base_url}/no_activity_report", params=params)
+        r.raise_for_status()
         res = r.json()
+        if not isinstance(res, dict) or not isinstance(res.get("reports"), list):
+            raise RuntimeError(f"Invalid no-activity response for {neris_id_entity}.")
 
         batch = res.get("reports", [])
         if not batch:
@@ -270,8 +280,8 @@ def generate_month_columns():
 # ─────────────────────────────────────────────
 
 def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags,
-                    type_counts):
-    from report_metadata import add_report_sources_sheet
+                    type_counts, fetch_errors=None, entity_names=None):
+    from report_metadata import add_report_sources_sheet, flag_incomplete_entity_tables
     import pandas as pd
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -423,6 +433,7 @@ def export_to_excel(df_pivot, month_cols, state_code, inc_counts, nar_flags,
          ("Included sheets", "Incident Type Summary, Monthly Incident Counts, Legend")],
     )
 
+    flag_incomplete_entity_tables(wb, fetch_errors or {}, entity_names or {})
     wb.save(filename)
     return filename
 
@@ -436,12 +447,16 @@ def main():
 
     import pandas as pd
 
-    state_code, entity_id = prompt_config()
+    state_code, scope, entity_id, entity_prefix, entity_names = prompt_config()
 
     client = authenticate()
 
     # Master department list
-    all_entities = fetch_all_entities(client, state_code, entity_id)
+    all_entities = fetch_all_entities(client, state_code)
+    try:
+        all_entities = select_entities(all_entities, scope, entity_id, entity_prefix, entity_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
     all_eids     = list(all_entities.keys())
 
     print(f"\nFetching incidents and NARs for {len(all_eids)} departments in parallel...")
@@ -548,7 +563,8 @@ def main():
     print(f"\nPivot table: {len(df_pivot)-1} departments x {len(month_cols)} months")
 
     filename = export_to_excel(
-        df_pivot, month_cols, state_code, inc_counts, nar_flags, type_counts
+        df_pivot, month_cols, state_code, inc_counts, nar_flags, type_counts,
+        dict(errors), all_entities
     )
 
     print(f"\n✓ Exported: {filename}")

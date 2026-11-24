@@ -15,9 +15,13 @@ Requirements (auto-installed if missing):
 import sys
 import subprocess
 import os
+from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from prompt_snippets import prompt_entity_scope, select_entities
 
 
 # ─────────────────────────────────────────────
@@ -62,12 +66,15 @@ def prompt_config():
 
     print("-- Query Parameters --")
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
-    entity_id  = input("NERIS Entity ID (optional — leave blank for all departments): ").strip() or None
+    try:
+        scope, entity_id, entity_prefix, entity_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     if not state_code:
         sys.exit("✗ State code is required.")
 
-    return state_code, entity_id
+    return state_code, scope, entity_id, entity_prefix, entity_names
 
 
 # ─────────────────────────────────────────────
@@ -345,12 +352,16 @@ def main():
 
     import pandas as pd
 
-    state_code, entity_id = prompt_config()
+    state_code, scope, entity_id, entity_prefix, entity_names = prompt_config()
 
     client = authenticate()
 
     # Master department list
-    all_entities = fetch_all_entities(client, state_code, entity_id)
+    all_entities = fetch_all_entities(client, state_code)
+    try:
+        all_entities = select_entities(all_entities, scope, entity_id, entity_prefix, entity_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
     all_eids     = list(all_entities.keys())
 
     print(f"\nFetching incidents and NARs for {len(all_eids)} departments in parallel...")

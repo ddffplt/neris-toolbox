@@ -19,6 +19,7 @@ from EntityFireActivityReport import (
 )
 
 from neris_auth import authenticate_with_fallback as _authenticate
+from prompt_snippets import prompt_entity_scope, select_entities
 
 CURRENT_YTD = "Occurred in current calendar year to date"
 DATE_RANGE_OPTIONS = _BASE_DATE_RANGE_OPTIONS[:-1] + [CURRENT_YTD, _BASE_DATE_RANGE_OPTIONS[-1]]
@@ -56,29 +57,10 @@ def prompt_config():
     print("=" * 60)
     state_code = input("State Code (e.g. VA, MI, CA): ").strip().upper()
 
-    print("\nScope Options:")
-    print("  1. Entire state")
-    print("  2. County (FD25 prefix)")
-    print("  3. Single entity")
-    while True:
-        scope = input("Select scope [1]: ").strip() or "1"
-        if scope in {"1", "2", "3"}:
-            break
-        print("  Invalid selection, choose 1, 2, or 3.")
-
-    entity_id = entity_prefix = None
-    if scope == "2":
-        while True:
-            entity_prefix = input("County prefix (e.g. FD25001): ").strip().upper().rstrip("*")
-            if entity_prefix.startswith("FD") and len(entity_prefix) >= 6:
-                break
-            print("  Enter a prefix such as FD25001.")
-    elif scope == "3":
-        while True:
-            entity_id = input("NERIS Entity ID (e.g. FD25001001): ").strip().upper()
-            if entity_id:
-                break
-            print("  An entity ID is required.")
+    try:
+        scope, entity_id, entity_prefix, selected_names = prompt_entity_scope(state_code)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print("\nDate Range Options:")
     for number, option in enumerate(DATE_RANGE_OPTIONS, 1):
@@ -109,7 +91,7 @@ def prompt_config():
 
     if not state_code:
         sys.exit("State code is required.")
-    return state_code, scope, entity_id, entity_prefix, range_type, start_date, end_date
+    return state_code, scope, entity_id, entity_prefix, selected_names, range_type, start_date, end_date
 
 
 def incident_month(incident):
@@ -166,10 +148,14 @@ def month_label(month):
     return f"{year} - {datetime(year, month_number, 1).strftime('%b')}"
 
 
-def export_excel(months, entities, entity_names, scope_label, state_code, range_label, range_type):
+def export_excel(months, entities, entity_names, scope_label, state_code, range_label, range_type,
+                 fetch_errors=None):
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
+    from report_metadata import add_fetch_issues_sheet, highlight_fetch_issue
+
+    fetch_errors = fetch_errors or {}
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(
@@ -204,12 +190,21 @@ def export_excel(months, entities, entity_names, scope_label, state_code, range_
     for entity_id in sorted(entity_names):
         values = entities.get(entity_id, {column: 0 for column in CASUALTY_COLUMNS})
         entity_sheet.append(
-            [entity_id, entity_names[entity_id]] + [values[column] for column in CASUALTY_COLUMNS]
+            [entity_id, entity_names[entity_id]]
+            + [None if entity_id in fetch_errors else values[column] for column in CASUALTY_COLUMNS]
         )
-        for column in CASUALTY_COLUMNS:
-            entity_totals[column] += values[column]
+        if entity_id not in fetch_errors:
+            for column in CASUALTY_COLUMNS:
+                entity_totals[column] += values[column]
         for column_index in range(1, len(entity_headers) + 1):
             entity_sheet.cell(entity_sheet.max_row, column_index).border = border
+        if entity_id in fetch_errors:
+            entity_sheet.cell(entity_sheet.max_row, len(entity_headers) + 1, "Data unavailable - see Fetch Issues")
+            highlight_fetch_issue(entity_sheet[entity_sheet.max_row])
+    if fetch_errors:
+        entity_sheet.cell(header_row, len(entity_headers) + 1, "Fetch Status")
+        style_header(entity_sheet, header_row, len(entity_headers) + 1)
+        entity_sheet.column_dimensions[get_column_letter(len(entity_headers) + 1)].width = 38
     entity_sheet.append(["Total", ""] + [entity_totals[column] for column in CASUALTY_COLUMNS])
     for column_index in range(1, len(entity_headers) + 1):
         cell = entity_sheet.cell(entity_sheet.max_row, column_index)
@@ -250,13 +245,23 @@ def export_excel(months, entities, entity_names, scope_label, state_code, range_
     month_sheet.column_dimensions["A"].width = 16
     for column_index in range(2, len(headers) + 1):
         month_sheet.column_dimensions[get_column_letter(column_index)].width = 14
+    if fetch_errors:
+        entity_sheet.cell(1, 1, f"INCOMPLETE - {len(fetch_errors)} entities unavailable; see Fetch Issues")
+        highlight_fetch_issue(entity_sheet[1][:1])
+        month_sheet.cell(1, 1, f"INCOMPLETE - {len(fetch_errors)} entities unavailable; see Fetch Issues")
+        highlight_fetch_issue(month_sheet[1][:1])
 
     from report_metadata import add_report_sources_sheet
 
+    add_fetch_issues_sheet(workbook, fetch_errors, entity_names)
     add_report_sources_sheet(
         workbook, "FireCasualtyReport.py", range_label,
         [("State code", state_code), ("Scope", scope_label), ("Date range", range_type),
-         ("Incident filter", "Incidents with a FIRE incident type")],
+         ("Incident filter", "Incidents with a FIRE incident type"),
+         ("Included sheets", "Entity Summary, Monthly Breakdown"
+          + (", Fetch Issues" if fetch_errors else "")),
+         ("Fetch status", f"Incomplete: {len(fetch_errors)} entities unavailable; see Fetch Issues."
+          if fetch_errors else "Complete")],
     )
     workbook.save(path)
     return path
@@ -264,39 +269,38 @@ def export_excel(months, entities, entity_names, scope_label, state_code, range_
 
 def main():
     ensure_dependencies()
-    (state_code, scope, entity_id, entity_prefix,
+    (state_code, scope, entity_id, entity_prefix, selected_names,
      range_type, start_date, end_date) = prompt_config()
     start, end = calculate_date_range(range_type, start_date, end_date)
     client = authenticate_client_credentials()
 
-    entity_names = fetch_entities(client, state_code, entity_id)
-    if entity_prefix:
-        entity_names = {eid: name for eid, name in entity_names.items()
-                        if str(eid).upper().startswith(entity_prefix)}
-    if not entity_names:
-        print("No entities found for the selected scope.")
-        return
+    all_entities = fetch_entities(client, state_code, None)
+    try:
+        entity_names = select_entities(all_entities, scope, entity_id, entity_prefix, selected_names)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     incidents = []
-    failed = []
+    failed = {}
     for current_entity in entity_names:
         print(f"Fetching {current_entity}...")
         try:
             incidents.extend(fetch_incidents(client, state_code, current_entity, start, end))
         except RuntimeError as error:
             print(f"  FAILED {current_entity}: {error}")
-            failed.append(current_entity)
+            failed[current_entity] = str(error)
     if failed:
         print(f"\nWARNING: {len(failed)} entities could not be retrieved and are missing from the report: "
               f"{', '.join(failed)}")
 
-    scope_label = {"1": f"Entire state ({state_code})",
-                   "2": f"County {entity_prefix}",
-                   "3": f"Entity {entity_id}"}[scope]
+    scope_label = {"statewide": f"Entire state ({state_code})",
+                   "fd25_prefix": f"County {entity_prefix}",
+                   "entity": f"Entity {entity_id}",
+                   "multiple_entities": f"Entities {', '.join(selected_names)}"}[scope]
     months = aggregate_by_month(incidents)
     entities = aggregate_by_entity(incidents)
     path = export_excel(months, entities, entity_names, scope_label, state_code,
-                        date_range_label(range_type, start_date, end_date), range_type)
+                        date_range_label(range_type, start_date, end_date), range_type, failed)
     print(f"\nExported: {path}")
     print(f"Incidents retrieved: {len(incidents)}")
 
